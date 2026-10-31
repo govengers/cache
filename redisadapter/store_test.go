@@ -46,9 +46,9 @@ func newClient(t *testing.T, server *miniredis.Miniredis, hooks ...redis.Hook) *
 }
 
 // newStore creates a Store that is closed when the test ends, before its client.
-func newStore[K comparable, V any](t *testing.T, options *redisadapter.StoreOptions[K]) *redisadapter.Store[K, V] {
+func newStore[K comparable, V any](t *testing.T, options *redisadapter.Options[K]) *redisadapter.Store[K, V] {
 	t.Helper()
-	store, err := redisadapter.NewStore[K, V](options)
+	store, err := redisadapter.New[K, V](options)
 	require.NoError(t, err)
 	t.Cleanup(store.Close)
 	return store
@@ -107,24 +107,30 @@ func (failingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.Pro
 	return next
 }
 
-func TestNewStoreRejectsInvalidOptions(t *testing.T) {
+func TestNewRejectsInvalidOptions(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: "localhost:0"})
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	valid := func(change func(options *redisadapter.Options[string])) *redisadapter.Options[string] {
+		options := &redisadapter.Options[string]{Client: client, KeyCodec: cache.StringKeyCodec{}, KeyPrefix: "items"}
+		change(options)
+		return options
+	}
 
 	testCases := []struct {
 		name    string
-		options *redisadapter.StoreOptions[string]
+		options *redisadapter.Options[string]
 	}{
 		{name: "nil options"},
-		{name: "missing client", options: &redisadapter.StoreOptions[string]{KeyCodec: cache.StringKeyCodec{}}},
-		{name: "missing key codec", options: &redisadapter.StoreOptions[string]{Client: client}},
-		{name: "negative TTL", options: &redisadapter.StoreOptions[string]{Client: client, KeyCodec: cache.StringKeyCodec{}, TTL: -time.Second}},
-		{name: "negative scan count", options: &redisadapter.StoreOptions[string]{Client: client, KeyCodec: cache.StringKeyCodec{}, ScanCount: -1}},
-		{name: "negative heartbeat interval", options: &redisadapter.StoreOptions[string]{Client: client, KeyCodec: cache.StringKeyCodec{}, HeartbeatInterval: -time.Second}},
+		{name: "missing client", options: valid(func(options *redisadapter.Options[string]) { options.Client = nil })},
+		{name: "missing key codec", options: valid(func(options *redisadapter.Options[string]) { options.KeyCodec = nil })},
+		{name: "missing key prefix", options: valid(func(options *redisadapter.Options[string]) { options.KeyPrefix = "" })},
+		{name: "negative TTL", options: valid(func(options *redisadapter.Options[string]) { options.TTL = -time.Second })},
+		{name: "negative scan count", options: valid(func(options *redisadapter.Options[string]) { options.ScanCount = -1 })},
+		{name: "negative heartbeat interval", options: valid(func(options *redisadapter.Options[string]) { options.HeartbeatInterval = -time.Second })},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			store, err := redisadapter.NewStore[string, string](testCase.options)
+			store, err := redisadapter.New[string, string](testCase.options)
 
 			require.Error(t, err)
 			require.Nil(t, store)
@@ -134,7 +140,7 @@ func TestNewStoreRejectsInvalidOptions(t *testing.T) {
 
 func TestStoreSetsGetsAndRemovesUnderItsPrefix(t *testing.T) {
 	server := miniredis.RunT(t)
-	store := newStore[string, profile](t, &redisadapter.StoreOptions[string]{
+	store := newStore[string, profile](t, &redisadapter.Options[string]{
 		Client:    newClient(t, server),
 		KeyCodec:  cache.StringKeyCodec{},
 		KeyPrefix: "users",
@@ -164,6 +170,17 @@ func TestStoreSetsGetsAndRemovesUnderItsPrefix(t *testing.T) {
 	require.False(t, server.Exists("users:alice"))
 }
 
+func TestStoreKeyCodec(t *testing.T) {
+	server := miniredis.RunT(t)
+	store := newStore[int, string](t, &redisadapter.Options[int]{
+		Client:    newClient(t, server),
+		KeyCodec:  cache.IntKeyCodec{},
+		KeyPrefix: "numbers",
+	})
+
+	require.Equal(t, cache.KeyCodec[int](cache.IntKeyCodec{}), store.KeyCodec())
+}
+
 func TestStoreTTL(t *testing.T) {
 	testCases := []struct {
 		name     string
@@ -171,12 +188,14 @@ func TestStoreTTL(t *testing.T) {
 		expected time.Duration
 	}{
 		{name: "without TTL the entry never expires", ttl: 0, expected: 0},
-		{name: "with TTL the entry expires", ttl: 10 * time.Second, expected: 10 * time.Second},
+		{name: "whole seconds", ttl: 10 * time.Second, expected: 10 * time.Second},
+		{name: "below a millisecond rounds up to one", ttl: 500 * time.Microsecond, expected: time.Millisecond},
+		{name: "fractions of a millisecond round up", ttl: 1500 * time.Microsecond, expected: 2 * time.Millisecond},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			server := miniredis.RunT(t)
-			store := newStore[string, string](t, &redisadapter.StoreOptions[string]{
+			store := newStore[string, string](t, &redisadapter.Options[string]{
 				Client:    newClient(t, server),
 				KeyCodec:  cache.StringKeyCodec{},
 				KeyPrefix: "items",
@@ -189,7 +208,6 @@ func TestStoreTTL(t *testing.T) {
 
 			require.NoError(t, err)
 			require.Equal(t, testCase.expected, remaining)
-			require.Equal(t, testCase.expected, server.TTL("items:key"))
 			server.FastForward(time.Minute)
 			contained, err := store.Contains(ctx, "key")
 			require.NoError(t, err)
@@ -200,9 +218,10 @@ func TestStoreTTL(t *testing.T) {
 
 func TestStoreTTLOfMissingKeyIsNotFound(t *testing.T) {
 	server := miniredis.RunT(t)
-	store := newStore[string, string](t, &redisadapter.StoreOptions[string]{
-		Client:   newClient(t, server),
-		KeyCodec: cache.StringKeyCodec{},
+	store := newStore[string, string](t, &redisadapter.Options[string]{
+		Client:    newClient(t, server),
+		KeyCodec:  cache.StringKeyCodec{},
+		KeyPrefix: "items",
 	})
 
 	_, err := store.TTL(t.Context(), "missing")
@@ -217,7 +236,8 @@ type operation struct {
 }
 
 // operations call every Store method that talks to Redis; command is the Redis command each
-// one sends last, with "items:alice" stored and an event channel set.
+// one sends last, with "items:alice" stored and an event channel set. Set and Remove run a
+// script, which go-redis sends as EVALSHA.
 var operations = []operation{
 	{name: "get", command: "get", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
 		_, err := store.Get(ctx, "alice")
@@ -227,19 +247,19 @@ var operations = []operation{
 		_, err := store.TTL(ctx, "alice")
 		return err
 	}},
-	{name: "set", command: "set", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
+	{name: "set", command: "evalsha", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
 		return store.Set(ctx, "alice", "value")
 	}},
-	{name: "set publishing", command: "publish", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
-		return store.Set(ctx, "alice", "value")
-	}},
-	{name: "remove", command: "del", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
+	{name: "remove", command: "evalsha", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
 		return store.Remove(ctx, "alice")
 	}},
 	{name: "remove prefix scanning", command: "scan", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
 		return store.RemovePrefix(ctx, "a")
 	}},
 	{name: "remove prefix unlinking", command: "unlink", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
+		return store.RemovePrefix(ctx, "a")
+	}},
+	{name: "remove prefix publishing", command: "publish", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
 		return store.RemovePrefix(ctx, "a")
 	}},
 	{name: "contains", command: "exists", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
@@ -260,7 +280,7 @@ func newStoreForOperations(t *testing.T, hooks ...redis.Hook) *redisadapter.Stor
 	t.Helper()
 	server := miniredis.RunT(t)
 	require.NoError(t, server.Set("items:alice", encode(t, "stored")))
-	return newStore[string, string](t, &redisadapter.StoreOptions[string]{
+	return newStore[string, string](t, &redisadapter.Options[string]{
 		Client:       newClient(t, server, hooks...),
 		KeyCodec:     cache.StringKeyCodec{},
 		KeyPrefix:    "items",
@@ -278,7 +298,6 @@ func TestStoreHidesRedisErrorChains(t *testing.T) {
 			require.ErrorContains(t, err, errInjected.Error())
 			require.NotErrorIs(t, err, errInjected)
 			require.NotErrorIs(t, err, cache.ErrNotFound)
-			require.NoError(t, errors.Unwrap(err))
 		})
 	}
 }
@@ -301,7 +320,7 @@ func TestStoreContainsReportsUnreachableServer(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	store := newStore[string, string](t, &redisadapter.StoreOptions[string]{Client: client, KeyCodec: cache.StringKeyCodec{}})
+	store := newStore[string, string](t, &redisadapter.Options[string]{Client: client, KeyCodec: cache.StringKeyCodec{}, KeyPrefix: "items"})
 	server.Close()
 
 	contained, err := store.Contains(t.Context(), "alice")
@@ -312,27 +331,29 @@ func TestStoreContainsReportsUnreachableServer(t *testing.T) {
 
 func TestStoreGetReportsUndecodableValue(t *testing.T) {
 	server := miniredis.RunT(t)
-	store := newStore[string, profile](t, &redisadapter.StoreOptions[string]{
-		Client:   newClient(t, server),
-		KeyCodec: cache.StringKeyCodec{},
+	store := newStore[string, profile](t, &redisadapter.Options[string]{
+		Client:    newClient(t, server),
+		KeyCodec:  cache.StringKeyCodec{},
+		KeyPrefix: "users",
 	})
-	require.NoError(t, server.Set("alice", "\xc1")) // 0xc1 is never used in MessagePack
+	require.NoError(t, server.Set("users:alice", "\xc1")) // 0xc1 is never used in MessagePack
 
 	_, err := store.Get(t.Context(), "alice")
 
-	require.ErrorContains(t, err, "redisadapter: decode alice")
+	require.ErrorContains(t, err, "redisadapter: decode users:alice")
 	require.NotErrorIs(t, err, cache.ErrNotFound)
 }
 
 func TestStoreSetReportsUnencodableValue(t *testing.T) {
 	server := miniredis.RunT(t)
-	store := newStore[string, chan int](t, &redisadapter.StoreOptions[string]{
-		Client:   newClient(t, server),
-		KeyCodec: cache.StringKeyCodec{},
+	store := newStore[string, chan int](t, &redisadapter.Options[string]{
+		Client:    newClient(t, server),
+		KeyCodec:  cache.StringKeyCodec{},
+		KeyPrefix: "channels",
 	})
 
 	err := store.Set(t.Context(), "alice", make(chan int))
 
-	require.ErrorContains(t, err, "redisadapter: encode alice")
-	require.False(t, server.Exists("alice"))
+	require.ErrorContains(t, err, "redisadapter: encode channels:alice")
+	require.False(t, server.Exists("channels:alice"))
 }

@@ -3,9 +3,12 @@
 package e2e
 
 import (
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/govengers/cache"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -55,6 +58,13 @@ func TestCachesAndElectionSurviveASentinelFailover(t *testing.T) {
 	waitForPromotableReplica(t, sentinel)
 	writer := newInstance(t, newFailoverClient(t), 0)
 	reader := newInstance(t, newFailoverClient(t), 0)
+	var resets atomic.Int64
+	unregister := reader.store.OnEvent(func(event cache.Event[string, product]) {
+		if event.Type == cache.EventReset {
+			resets.Add(1)
+		}
+	})
+	t.Cleanup(unregister)
 	elected := make(chan string, 4)
 	election := newElection(t, newFailoverClient(t), "only", elected)
 	require.NoError(t, election.Start(t.Context()))
@@ -65,8 +75,12 @@ func TestCachesAndElectionSurviveASentinelFailover(t *testing.T) {
 	requireEventually(t, reader.synchronized, "product:desk", product{Name: "desk"})
 	// A change without an event: only the reset after the failover makes the reader see it.
 	redisKey := "e2e:" + t.Name() + ":product:desk"
-	require.NoError(t, writer.client.Set(t.Context(), redisKey, mustEncode(t, product{Name: "changed"}), 0).Err())
-	require.NoError(t, writer.client.Wait(t.Context(), 1, failoverDeadline).Err())
+	connection := writer.client.Conn() // WAIT counts the writes of its own connection
+	t.Cleanup(func() { require.NoError(t, connection.Close()) })
+	require.NoError(t, connection.Set(t.Context(), redisKey, mustEncode(t, product{Name: "changed"}), 0).Err())
+	acknowledgements, err := connection.Wait(t.Context(), 1, failoverDeadline).Result()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, acknowledgements, int64(1), "the replica must hold the change before the failover")
 	primaryBeforeFailover := primaryAddress(t, sentinel)
 
 	require.NoError(t, sentinel.Failover(t.Context(), environment(t, "E2E_SENTINEL_MASTER")).Err())
@@ -74,6 +88,7 @@ func TestCachesAndElectionSurviveASentinelFailover(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return primaryAddress(t, sentinel) != primaryBeforeFailover
 	}, failoverDeadline, 100*time.Millisecond)
+	require.Eventually(t, func() bool { return resets.Load() > 0 }, failoverDeadline, 100*time.Millisecond)
 	require.Eventually(t, func() bool {
 		value, err := reader.synchronized.Get(t.Context(), "product:desk")
 		return err == nil && value == product{Name: "changed"}
@@ -84,7 +99,11 @@ func TestCachesAndElectionSurviveASentinelFailover(t *testing.T) {
 	}, failoverDeadline, 100*time.Millisecond)
 	requireEventually(t, reader.synchronized, "product:chair", product{Name: "chair"})
 
+	// The lock on the new primary holds this election's current lock value.
+	lockKey := "e2e:" + t.Name() + ":lock"
 	require.Eventually(t, func() bool {
-		return election.IsLeader() && election.FencingToken() >= tokenBeforeFailover
+		lockValue, err := writer.client.Get(t.Context(), lockKey).Result()
+		token := election.FencingToken()
+		return err == nil && election.IsLeader() && token >= tokenBeforeFailover && lockValue == "only:"+strconv.FormatInt(token, 10)
 	}, failoverDeadline, 100*time.Millisecond)
 }

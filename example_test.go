@@ -44,7 +44,7 @@ func ExampleSynchronized() {
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	defer client.Close()
 
-	store, err := redisadapter.NewStore[string, string](&redisadapter.StoreOptions[string]{
+	store, err := redisadapter.New[string, string](&redisadapter.Options[string]{
 		Client:       client,
 		KeyCodec:     cache.StringKeyCodec{},
 		KeyPrefix:    "greetings",
@@ -58,16 +58,18 @@ func ExampleSynchronized() {
 
 	greetings, err := cache.NewSynchronized(&cache.SynchronizedOptions[string, string]{
 		Backend:   store,
-		KeyCodec:  cache.StringKeyCodec{},
 		LocalTTL:  time.Minute,
 		LocalSize: 1000,
 	})
 	if err != nil {
 		panic(err)
 	}
-	defer greetings.Close()
-
 	ctx := context.Background()
+	defer func() {
+		if err := greetings.Close(ctx); err != nil {
+			panic(err)
+		}
+	}()
 	if err := greetings.Set(ctx, "en", "hello"); err != nil {
 		panic(err)
 	}

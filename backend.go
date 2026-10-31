@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 )
 
@@ -33,6 +34,22 @@ const (
 	EventReset
 )
 
+// String returns the name of the event type, for logs and test output.
+func (t EventType) String() string {
+	switch t {
+	case EventSet:
+		return "set"
+	case EventRemove:
+		return "remove"
+	case EventRemovePrefix:
+		return "remove prefix"
+	case EventReset:
+		return "reset"
+	default:
+		return "EventType(" + strconv.Itoa(int(t)) + ")"
+	}
+}
+
 // Event is a change to a Backend, made by this process or by another one sharing the backend.
 type Event[K comparable, V any] struct {
 	Type   EventType
@@ -56,6 +73,9 @@ type Backend[K comparable, V any] interface {
 	Contains(ctx context.Context, key K) (bool, error)
 	// Load returns every entry in the backend.
 	Load(ctx context.Context) ([]Entry[K, V], error)
-	// OnEvent registers handler for every change to the backend, including the caller's own.
-	OnEvent(handler func(Event[K, V]))
+	// KeyCodec returns the codec the backend encodes keys with; prefixes match on its encoding.
+	KeyCodec() KeyCodec[K]
+	// OnEvent registers handler for every change to the backend, including the caller's own, in
+	// the order the backend applied them. The returned function unregisters it.
+	OnEvent(handler func(Event[K, V])) (unregister func())
 }

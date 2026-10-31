@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
-	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -30,12 +29,12 @@ type Parameters struct {
 	Channel string
 	Logger  *slog.Logger
 	// HeartbeatInterval is how often a numbered heartbeat is published, through Client's normal
-	// connections, to a channel only this subscription listens on. A subscription that skips a
-	// heartbeat, or has received none for three intervals, is renewed: it may sit on a former
-	// primary (go-redis moves normal connections after a Sentinel failover, not Pub/Sub ones),
-	// which misses what the new primary publishes until it rejoins as a replica, or on a
-	// connection that died silently. A handler that blocks OnMessage for three intervals also
-	// renews it.
+	// connections, to a channel only this subscription listens on, together with a read of the
+	// primary's replication ID. The subscription is renewed when the replication ID changes,
+	// when a heartbeat is skipped, or when none arrived for three intervals: it may sit on a
+	// former primary (go-redis moves normal connections after a Sentinel failover, not Pub/Sub
+	// ones) that misses what the new primary publishes, or on a connection that died silently.
+	// A handler that blocks OnMessage for three intervals also renews it.
 	HeartbeatInterval time.Duration
 	// OnSubscribed runs each time the subscription is established, before any message of it.
 	// Optional.
@@ -70,7 +69,8 @@ func receiveUntilFailure(ctx context.Context, parameters *Parameters) bool {
 	defer stopClosing()
 	defer func() { _ = pubSub.Close() }()
 
-	if _, err := pubSub.Receive(ctx); err != nil {
+	// A connection that died silently would block an unbounded wait for the confirmation.
+	if _, err := pubSub.ReceiveTimeout(ctx, missedHeartbeats*parameters.HeartbeatInterval); err != nil {
 		logFailure(ctx, parameters, "redis: subscribing failed", err)
 		return false
 	}
@@ -83,7 +83,10 @@ func receiveUntilFailure(ctx context.Context, parameters *Parameters) bool {
 			parameters.Logger.Warn("redis: subscription missed its heartbeats, resubscribing", "channel", parameters.Channel)
 			return true
 		}
-		heartbeat.publishIfDue(ctx, parameters)
+		if heartbeat.publishIfDue(ctx, parameters) {
+			parameters.Logger.Warn("redis: the primary changed, resubscribing", "channel", parameters.Channel)
+			return true
+		}
 		received, err := pubSub.ReceiveTimeout(ctx, parameters.HeartbeatInterval)
 		if isTimeout(err) {
 			continue
@@ -97,65 +100,6 @@ func receiveUntilFailure(ctx context.Context, parameters *Parameters) bool {
 			return true
 		}
 	}
-}
-
-// heartbeat numbers what it publishes: a gap in what arrives means the subscription missed
-// messages, as it does after a failover until the former primary rejoins as a replica, even
-// though later heartbeats arrive in time.
-type heartbeat struct {
-	channel         string
-	interval        time.Duration
-	lastPublishedAt time.Time
-	lastReceivedAt  time.Time
-	published       uint64
-	received        uint64
-}
-
-func (h *heartbeat) missed(now time.Time) bool {
-	return now.Sub(h.lastReceivedAt) > missedHeartbeats*h.interval
-}
-
-func (h *heartbeat) publishIfDue(ctx context.Context, parameters *Parameters) {
-	if time.Since(h.lastPublishedAt) < h.interval {
-		return
-	}
-	h.lastPublishedAt = time.Now()
-	publishContext, cancel := context.WithTimeout(ctx, h.interval)
-	defer cancel()
-	err := parameters.Client.Publish(publishContext, h.channel, strconv.FormatUint(h.published+1, 10)).Err()
-	if err != nil {
-		// The number is reused, so a heartbeat that was delivered despite the error is not
-		// taken for a gap.
-		logFailure(ctx, parameters, "redis: publishing the subscription heartbeat failed", err)
-		return
-	}
-	h.published++
-}
-
-// dispatch records a heartbeat and hands a message on the subscribed channel to onMessage;
-// subscription confirmations and pongs carry nothing. It reports whether a heartbeat was lost.
-func (h *heartbeat) dispatch(received any, onMessage func(payload string)) bool {
-	message, isMessage := received.(*redis.Message)
-	switch {
-	case !isMessage:
-		return false
-	case message.Channel == h.channel:
-		return h.record(message.Payload)
-	default:
-		onMessage(message.Payload)
-		return false
-	}
-}
-
-func (h *heartbeat) record(payload string) bool {
-	number, err := strconv.ParseUint(payload, 10, 64)
-	if err != nil || number <= h.received {
-		return false
-	}
-	lost := number > h.received+1
-	h.received = number
-	h.lastReceivedAt = time.Now()
-	return lost
 }
 
 func isTimeout(err error) bool {

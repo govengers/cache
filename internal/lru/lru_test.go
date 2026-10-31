@@ -225,6 +225,24 @@ func TestLRURemoveFuncDeletesMatchingKeys(t *testing.T) {
 	require.Equal(t, []string{"group:1"}, keysOf(cache.Entries()))
 }
 
+func TestLRUClearDeletesEveryEntry(t *testing.T) {
+	cache := New[string, int](2, time.Hour)
+	cache.Add("first", 1)
+	cache.Add("second", 2)
+	expire(t, cache, "first")
+
+	cache.Clear()
+
+	require.Zero(t, cache.Len())
+	require.Empty(t, cache.Entries())
+	require.False(t, cache.Contains("second"))
+
+	cache.Add("third", 3)
+	cache.Add("fourth", 4)
+	cache.Add("fifth", 5)
+	require.Equal(t, []string{"fourth", "fifth"}, keysOf(cache.Entries()), "the size bound still holds after Clear")
+}
+
 func TestLRUConcurrentAccess(t *testing.T) {
 	const (
 		size       = 128

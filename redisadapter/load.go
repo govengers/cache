@@ -50,14 +50,15 @@ func (s *Store[K, V]) scan(ctx context.Context, prefix string, handle func(redis
 	}
 }
 
-// escapePattern makes text match itself literally in a Redis glob pattern.
+// escapePattern makes text match itself literally in a Redis glob pattern. It works on bytes,
+// so keys that are not valid UTF-8 survive unchanged.
 func escapePattern(text string) string {
 	var escaped strings.Builder
-	for _, character := range text {
-		if strings.ContainsRune(`*?[]\`, character) {
-			escaped.WriteRune('\\')
+	for index := range len(text) {
+		if strings.IndexByte(`*?[]\`, text[index]) >= 0 {
+			escaped.WriteByte('\\')
 		}
-		escaped.WriteRune(character)
+		escaped.WriteByte(text[index])
 	}
 	return escaped.String()
 }

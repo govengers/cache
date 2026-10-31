@@ -59,7 +59,7 @@ func environment(t *testing.T, name string) string {
 // test, so tests never see each other's keys.
 func newInstance(t *testing.T, client *redis.Client, ttl time.Duration) *instance {
 	t.Helper()
-	store, err := redisadapter.NewStore[string, product](&redisadapter.StoreOptions[string]{
+	store, err := redisadapter.New[string, product](&redisadapter.Options[string]{
 		Client:       client,
 		KeyCodec:     cache.StringKeyCodec{},
 		KeyPrefix:    "e2e:" + t.Name(),
@@ -70,15 +70,13 @@ func newInstance(t *testing.T, client *redis.Client, ttl time.Duration) *instanc
 		Logger:            slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	})
 	require.NoError(t, err)
-	synchronized, err := cache.NewSynchronized(&cache.SynchronizedOptions[string, product]{
-		Backend:  store,
-		KeyCodec: cache.StringKeyCodec{},
-	})
+	synchronized, err := cache.NewSynchronized(&cache.SynchronizedOptions[string, product]{Backend: store})
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		synchronized.Close()
+		cleanupContext := context.WithoutCancel(t.Context())
+		require.NoError(t, synchronized.Close(cleanupContext))
 		store.Close()
-		require.NoError(t, store.RemovePrefix(context.WithoutCancel(t.Context()), ""))
+		require.NoError(t, store.RemovePrefix(cleanupContext, ""))
 	})
 	require.NoError(t, store.AwaitSubscription(t.Context()))
 	return &instance{client: client, store: store, synchronized: synchronized}

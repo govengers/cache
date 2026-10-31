@@ -20,12 +20,13 @@ func ExampleElection() {
 	defer client.Close()
 
 	elected := make(chan struct{})
-	election, err := leader.NewElection(&leader.ElectionOptions{
+	election, err := leader.New(&leader.Options{
 		Client:        client,
 		LockKey:       "billing:scheduler",
 		LeaseDuration: 10 * time.Second,
 		EventChannel:  "billing:scheduler:resignations",
-		OnElected: func(ctx context.Context) {
+		OnElected: func(ctx context.Context, fencingToken int64) {
+			fmt.Println("elected with fencing token", fencingToken)
 			close(elected)
 			<-ctx.Done() // lead until the leadership ends
 		},
@@ -39,13 +40,14 @@ func ExampleElection() {
 		panic(err)
 	}
 	<-elected
-	fmt.Println(election.IsLeader(), election.FencingToken())
+	fmt.Println(election.IsLeader())
 
 	if err := election.Stop(ctx); err != nil {
 		panic(err)
 	}
 	fmt.Println(election.IsLeader())
 	// Output:
-	// true 1
+	// elected with fencing token 1
+	// true
 	// false
 }

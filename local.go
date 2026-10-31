@@ -21,7 +21,8 @@ type LocalOptions[K comparable] struct {
 }
 
 // Local is an in-memory LRU cache with an optional TTL. It is safe for concurrent use and starts
-// no goroutines.
+// no goroutines. Values are stored as given, not copied: do not change a value after passing it
+// to Set or receiving it from Get.
 type Local[K comparable, V any] struct {
 	keyCodec KeyCodec[K]
 	entries  *lru.LRU[K, V]
@@ -63,6 +64,11 @@ func (c *Local[K, V]) RemovePrefix(prefix string) {
 	c.entries.RemoveFunc(func(key K) bool {
 		return strings.HasPrefix(c.keyCodec.Encode(key), prefix)
 	})
+}
+
+// Clear deletes every entry.
+func (c *Local[K, V]) Clear() {
+	c.entries.Clear()
 }
 
 // Contains reports whether key holds an unexpired value.

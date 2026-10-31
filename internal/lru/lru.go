@@ -123,6 +123,14 @@ func (c *LRU[K, V]) RemoveFunc(match func(key K) bool) {
 	}
 }
 
+// Clear deletes every entry.
+func (c *LRU[K, V]) Clear() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.recency.Init()
+	clear(c.elements)
+}
+
 // Entries returns the unexpired entries from the least to the most recently used, without
 // changing their recency.
 func (c *LRU[K, V]) Entries() []Entry[K, V] {

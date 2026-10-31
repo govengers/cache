@@ -126,6 +126,19 @@ func TestLocalSizeDropsTheLeastRecentlyUsedEntry(t *testing.T) {
 	require.True(t, local.Contains("third"))
 }
 
+func TestLocalClearDeletesEveryEntry(t *testing.T) {
+	local := newLocal[string, int](t, &cache.LocalOptions[string]{KeyCodec: cache.StringKeyCodec{}})
+	local.Set("first", 1)
+	local.Set("second", 2)
+
+	local.Clear()
+
+	require.Empty(t, local.Entries())
+	require.False(t, local.Contains("first"))
+	local.Set("third", 3)
+	require.Equal(t, []cache.Entry[string, int]{{Key: "third", Value: 3}}, local.Entries())
+}
+
 func TestLocalTTLExpiresEntries(t *testing.T) {
 	local := newLocal[string, int](t, &cache.LocalOptions[string]{KeyCodec: cache.StringKeyCodec{}, TTL: 5 * time.Millisecond})
 	local.Set("key", 1)

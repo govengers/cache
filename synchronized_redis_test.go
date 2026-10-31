@@ -21,26 +21,24 @@ func newRedisClient(t *testing.T, miniRedis *miniredis.Miniredis) *redis.Client 
 	return client
 }
 
-func newStore(t *testing.T, options *redisadapter.StoreOptions[string]) *redisadapter.Store[string, string] {
+func newStore(t *testing.T, options *redisadapter.Options[string]) *redisadapter.Store[string, string] {
 	t.Helper()
 	options.KeyCodec = cache.StringKeyCodec{}
 	options.KeyPrefix = "test"
-	store, err := redisadapter.NewStore[string, string](options)
+	store, err := redisadapter.New[string, string](options)
 	require.NoError(t, err)
 	t.Cleanup(store.Close)
 	return store
 }
 
-// newPeer returns a Synchronized cache whose store shares the event channel on miniRedis, once
-// its store is subscribed.
-func newPeer(t *testing.T, miniRedis *miniredis.Miniredis) *cache.Synchronized[string, string] {
+// newPeer returns a Synchronized cache, and its store, whose store shares the event channel on
+// miniRedis, once the store is subscribed.
+func newPeer(t *testing.T, miniRedis *miniredis.Miniredis) (*cache.Synchronized[string, string], *redisadapter.Store[string, string]) {
 	t.Helper()
-	subscribers := miniRedis.PubSubNumSub(eventChannel)[eventChannel]
-	store := newStore(t, &redisadapter.StoreOptions[string]{Client: newRedisClient(t, miniRedis), EventChannel: eventChannel})
-	require.Eventually(t, func() bool {
-		return miniRedis.PubSubNumSub(eventChannel)[eventChannel] == subscribers+1
-	}, time.Second, time.Millisecond)
-	return newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: store})
+	store := newStore(t, &redisadapter.Options[string]{Client: newRedisClient(t, miniRedis), EventChannel: eventChannel})
+	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: store})
+	require.NoError(t, store.AwaitSubscription(t.Context()))
+	return synchronized, store
 }
 
 func requireValue(t *testing.T, synchronized *cache.Synchronized[string, string], key, value string) {
@@ -70,7 +68,7 @@ func requireEventuallyNotFound(t *testing.T, synchronized *cache.Synchronized[st
 
 func TestSynchronizedGetKeepsBackendValuesLocally(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
-	store := newStore(t, &redisadapter.StoreOptions[string]{Client: newRedisClient(t, miniRedis)})
+	store := newStore(t, &redisadapter.Options[string]{Client: newRedisClient(t, miniRedis)})
 	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: store})
 	require.NoError(t, store.Set(t.Context(), "key", "value"))
 
@@ -90,19 +88,16 @@ func TestSynchronizedWritesReachBackendAndLocalCache(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			miniRedis := miniredis.RunT(t)
-			store := newStore(t, &redisadapter.StoreOptions[string]{Client: newRedisClient(t, miniRedis)})
+			store := newStore(t, &redisadapter.Options[string]{Client: newRedisClient(t, miniRedis)})
 			synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: store, AsyncWrites: asyncWrites})
 			ctx := t.Context()
 
 			for _, key := range []string{"user:1", "user:2", "user:3", "group:1"} {
 				require.NoError(t, synchronized.Set(ctx, key, key+" value"))
 			}
-			synchronized.Close()
-			require.Equal(t, []string{"test:group:1", "test:user:1", "test:user:2", "test:user:3"}, miniRedis.Keys())
-
 			require.NoError(t, synchronized.Remove(ctx, "user:1"))
 			require.NoError(t, synchronized.RemovePrefix(ctx, "user:"))
-			synchronized.Close()
+			require.NoError(t, synchronized.Close(ctx))
 			require.Equal(t, []string{"test:group:1"}, miniRedis.Keys())
 
 			miniRedis.FlushAll()
@@ -117,7 +112,7 @@ func TestSynchronizedWritesReachBackendAndLocalCache(t *testing.T) {
 
 func TestSynchronizedContains(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
-	store := newStore(t, &redisadapter.StoreOptions[string]{Client: newRedisClient(t, miniRedis)})
+	store := newStore(t, &redisadapter.Options[string]{Client: newRedisClient(t, miniRedis)})
 	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: store})
 	ctx := t.Context()
 	require.NoError(t, synchronized.Set(ctx, "local", "value"))
@@ -143,7 +138,7 @@ func TestSynchronizedContains(t *testing.T) {
 
 func TestSynchronizedTTL(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
-	store := newStore(t, &redisadapter.StoreOptions[string]{Client: newRedisClient(t, miniRedis), TTL: 10 * time.Second})
+	store := newStore(t, &redisadapter.Options[string]{Client: newRedisClient(t, miniRedis), TTL: 10 * time.Second})
 	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: store})
 	require.NoError(t, synchronized.Set(t.Context(), "key", "value"))
 
@@ -158,7 +153,7 @@ func TestSynchronizedTTL(t *testing.T) {
 
 func TestSynchronizedPreloadCopiesTheBackend(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
-	store := newStore(t, &redisadapter.StoreOptions[string]{Client: newRedisClient(t, miniRedis)})
+	store := newStore(t, &redisadapter.Options[string]{Client: newRedisClient(t, miniRedis)})
 	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: store})
 	require.NoError(t, store.Set(t.Context(), "first", "one"))
 	require.NoError(t, store.Set(t.Context(), "second", "two"))
@@ -172,8 +167,8 @@ func TestSynchronizedPreloadCopiesTheBackend(t *testing.T) {
 
 func TestSynchronizedChangesReachPeers(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
-	writer := newPeer(t, miniRedis)
-	reader := newPeer(t, miniRedis)
+	writer, _ := newPeer(t, miniRedis)
+	reader, _ := newPeer(t, miniRedis)
 	ctx := t.Context()
 
 	for _, key := range []string{"user:1", "user:2", "group:1"} {
@@ -194,9 +189,9 @@ func TestSynchronizedChangesReachPeers(t *testing.T) {
 
 func TestSynchronizedResetsAfterTheEventChannelDropped(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
-	writer := newPeer(t, miniRedis)
-	reader := newPeer(t, miniRedis)
-	silentStore := newStore(t, &redisadapter.StoreOptions[string]{Client: newRedisClient(t, miniRedis)})
+	writer, _ := newPeer(t, miniRedis)
+	reader, _ := newPeer(t, miniRedis)
+	silentStore := newStore(t, &redisadapter.Options[string]{Client: newRedisClient(t, miniRedis)})
 	ctx := t.Context()
 
 	require.NoError(t, writer.Set(ctx, "key", "before"))
@@ -209,4 +204,23 @@ func TestSynchronizedResetsAfterTheEventChannelDropped(t *testing.T) {
 
 	requireEventuallyValue(t, reader, "key", "after")
 	requireEventuallyValue(t, writer, "key", "after")
+}
+
+func TestSynchronizedAppliesNoEventsAfterClose(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	writer, _ := newPeer(t, miniRedis)
+	closed, sharedStore := newPeer(t, miniRedis)
+	// witness registers on the same store after closed, so it receives every event after closed
+	// would have.
+	witness := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: sharedStore})
+	ctx := t.Context()
+	require.NoError(t, writer.Set(ctx, "key", "old"))
+	requireValue(t, closed, "key", "old")
+	requireValue(t, witness, "key", "old")
+
+	require.NoError(t, closed.Close(ctx))
+	require.NoError(t, writer.Set(ctx, "key", "new"))
+
+	requireEventuallyValue(t, witness, "key", "new")
+	requireValue(t, closed, "key", "old")
 }

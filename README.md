@@ -19,7 +19,7 @@ Typed caches for Go: an in-memory LRU cache, a local cache kept in step across p
 go get github.com/govengers/cache
 ```
 
-Requires Go 1.26. Every type is safe for concurrent use. The library never logs on its own: components that hit failures they cannot return (a dropped subscription, a failed background write) report them to the optional `Logger` in their options.
+Requires Go 1.26. Every type is safe for concurrent use. Values are stored as given, not copied: do not change a value after passing it to `Set` or receiving it from `Get`. The library never logs on its own: components that hit failures they cannot return (a dropped subscription, a failed background write) report them to the optional `Logger` in their options.
 
 ## Local cache
 
@@ -37,6 +37,7 @@ sessions.Set("session:alice", 42)
 userID, found := sessions.Get("session:alice")
 sessions.Remove("session:alice")
 sessions.RemovePrefix("session:") // every key whose encoding starts with the prefix
+sessions.Clear()
 ```
 
 `Local` starts no goroutines and needs no `Close`. Expired entries are invisible at once and reclaimed by the next write after a TTL has passed.
@@ -62,10 +63,10 @@ type KeyCodec[K comparable] interface {
 client := redis.NewClient(&redis.Options{Addr: "localhost:6379"}) // you own it: instrument it, close it last
 defer client.Close()
 
-store, err := redisadapter.NewStore[string, Product](&redisadapter.StoreOptions[string]{
+store, err := redisadapter.New[string, Product](&redisadapter.Options[string]{
     Client:       client,
     KeyCodec:     cache.StringKeyCodec{},
-    KeyPrefix:    "products",        // keys are stored as products:<key>
+    KeyPrefix:    "products",        // required: keys are stored as products:<key>
     TTL:          10 * time.Minute,  // zero: forever
     EventChannel: "products:events", // empty: no change events between processes
     Logger:       logger,            // optional
@@ -76,15 +77,14 @@ if err != nil {
 defer store.Close()
 
 products, err := cache.NewSynchronized(&cache.SynchronizedOptions[string, Product]{
-    Backend:   store,
-    KeyCodec:  cache.StringKeyCodec{}, // must match the store's
+    Backend:   store, // its KeyCodec is used locally too
     LocalTTL:  time.Minute,
     LocalSize: 1000,
 })
 if err != nil {
     return err
 }
-defer products.Close()
+defer products.Close(context.WithoutCancel(ctx)) // stops applying events, drains background writes
 
 // Optional: copy every entry into the local cache, once the store receives events. The store
 // resets the local cache whenever its subscription is (re)established, so a preload before that
@@ -105,11 +105,12 @@ if errors.Is(err, cache.ErrNotFound) {
 
 ### Consistency
 
-- **Events arrive at most once.** A change made while a store has no subscription (before the first one is up, or while it reconnects) is never delivered. Each time the subscription is established, the store sends `EventReset`, and `Synchronized` drops its whole local cache, so nothing read before survives. A subscription that silently stops receiving (a dead connection, a Sentinel failover) is detected by its heartbeat and renewed the same way.
-- **Redis expiry sends no event.** Keep `LocalTTL` at most the store's `TTL`, or a local copy outlives the shared entry.
-- **A read never undoes a change.** A value read from the backend is only kept locally if no change was applied while the read was in flight.
-- **Async writes trade safety for latency.** With `AsyncWrites`, `Set`, `Remove` and `RemovePrefix` change the local cache and return at once; the backend write runs in the background and a failure is only logged (a failed `Set` also drops the local copy). `Close` waits for pending background writes.
-- **`RemovePrefix` scans.** In Redis it walks the namespace with `SCAN` and `UNLINK`s in pages; keys written while it runs may survive.
+- **Events follow Redis's order.** `Set` and `Remove` change the key and publish the event in one Lua script, so every subscriber applies changes in the order Redis applied them, and no change is applied without its event.
+- **Events arrive at most once.** A change made while a store has no subscription (before the first one is up, or while it reconnects) is never delivered. Each time the subscription is established, the store sends `EventReset`, and `Synchronized` drops its whole local cache, so nothing read before survives. An event that cannot be decoded is turned into `EventReset` too. A subscription that silently stops receiving (a dead connection, a Sentinel failover) is detected by its heartbeat and renewed the same way.
+- **Redis expiry sends no event.** A local copy can outlive the shared entry by up to `LocalTTL`.
+- **A read never undoes a change.** A value read from the backend, or written by a synchronous `Set`, is only kept locally if that key (or a prefix covering it) did not change while the call was in flight. Changes to other keys do not interfere.
+- **Async writes trade safety for latency.** With `AsyncWrites`, `Set`, `Remove` and `RemovePrefix` change the local cache and return at once; one background goroutine writes to the backend in the order of the calls, each write bounded by `AsyncTimeout` (default 10s). A failure is only logged (a failed `Set` also drops the local copy). At most `AsyncQueueSize` writes (default 1024) wait; beyond that a write blocks until there is room or its context ends. `Close(ctx)` drains the queue; later writes return `ErrClosed`.
+- **`RemovePrefix` scans.** In Redis it walks the namespace with `SCAN` and `UNLINK`s in pages; keys written while it runs may survive. Its event is published even when it fails part way.
 
 ### Redis Sentinel
 
@@ -122,7 +123,7 @@ client := redis.NewFailoverClient(&redis.FailoverOptions{
 })
 ```
 
-After a failover go-redis moves its normal connections to the new primary, but not its Pub/Sub connections: those stay subscribed on the demoted server and miss what is published on the new one. Every subscription therefore publishes numbered heartbeats to a channel of its own through the normal connections, and renews itself when one goes missing or none arrives for three `HeartbeatInterval`s (default 5s). The store then subscribes on the new primary and sends `EventReset`, so no local copy survives the switch. The end-to-end suite runs a real Sentinel failover.
+After a failover go-redis moves its normal connections to the new primary, but not its Pub/Sub connections: those stay subscribed on the demoted server and miss what is published on the new one. Every subscription therefore sends a heartbeat every `HeartbeatInterval` (default 5s) through the normal connections: a numbered message to a channel of its own, and a read of the primary's replication ID. It renews itself when the replication ID changes (another server was promoted, or the primary restarted without its data), when a heartbeat goes missing, or when none arrives for three intervals. The store then subscribes on the new primary and sends `EventReset`, so no local copy survives the switch. The end-to-end suite runs a real Sentinel failover.
 
 Redis Cluster is not supported: `Load` and `RemovePrefix` scan one node, and the election's scripts touch two keys.
 
@@ -132,18 +133,18 @@ The store uses your client, so instrument it the go-redis way, e.g. with `rediso
 
 ### Your own backend
 
-`Synchronized` works with any implementation of `cache.Backend`: `Get` returns an error matching `cache.ErrNotFound` on a miss, and `OnEvent` handlers receive every change, including the process's own.
+`Synchronized` works with any implementation of `cache.Backend`: `Get` returns an error matching `cache.ErrNotFound` on a miss, `KeyCodec` returns the codec prefixes match on, and `OnEvent` handlers receive every change, including the process's own, in the backend's order, until they are unregistered.
 
 ## Leader election
 
 ```go
-election, err := leader.NewElection(&leader.ElectionOptions{
+election, err := leader.New(&leader.Options{
     Client:        client,
     LockKey:       "billing:scheduler",
-    LeaseDuration: 10 * time.Second,                 // a crashed leader is replaced after at most this long
+    LeaseDuration: 10 * time.Second,                 // a crashed leader's lock expires after at most this long
     EventChannel:  "billing:scheduler:resignations", // optional: followers take over at once on Stop
-    OnElected: func(ctx context.Context) {
-        runScheduler(ctx) // must return when ctx is cancelled: the leadership ended
+    OnElected: func(ctx context.Context, fencingToken int64) {
+        runScheduler(ctx, fencingToken) // must return when ctx is cancelled: the leadership ended
     },
     OnDemoted: func() {},
 })
@@ -156,9 +157,9 @@ if err := election.Start(ctx); err != nil {
 defer election.Stop(context.WithoutCancel(ctx)) // releases the lock, waits for OnElected
 ```
 
-The leader renews its lease every `RenewInterval` (default a third of the lease, at most half). It steps down when the lock was taken over, or when no renewal succeeded by one `RenewInterval` before the lease may expire, even if Redis hangs instead of failing. When the context given to `Start` ends, the leader steps down and releases the lock. Followers retry every `RetryInterval` (default half the lease) plus jitter.
+The leader renews its lease every `RenewInterval` (default a third of the lease, at most half). It steps down when the lock was taken over, or when no renewal succeeded by one `RenewInterval` before the lease may expire, even if Redis hangs instead of failing (the election stops waiting for a Redis reply at that deadline, whatever the client's timeouts). When the context given to `Start` ends, the leader steps down and releases the lock. Followers retry every `RetryInterval` (default half the lease) plus jitter. A new term's `OnElected` never starts before the previous one returned.
 
-A leader cut off from Redis can believe it leads for up to one lease minus one `RenewInterval`, and a paused process (GC, a frozen VM) for longer. Guard writes that must never overlap with the **fencing token**: `FencingToken()` grows with every new leadership, so storage that rejects tokens smaller than the largest it has seen keeps a stale leader out.
+A leader cut off from Redis can believe it leads for up to one lease minus one `RenewInterval`, and a paused process (GC, a frozen VM) for longer. Guard writes that must never overlap with the **fencing token** `OnElected` receives: it grows with every new leadership, so storage that rejects tokens smaller than the largest it has seen keeps a stale leader out. (`FencingToken()` returns the token of the current term; work of an older term must keep using the token it was given.)
 
 ```sql
 UPDATE jobs SET state = $1, fencing_token = $2 WHERE id = $3 AND fencing_token <= $2
@@ -173,19 +174,21 @@ v1.0.0 is the first release under `github.com/govengers/cache`. The old module s
 | v0 (`mxcd/go-cache`) | v1 (`govengers/cache`) |
 |----------------------|------------------------|
 | `CacheKey[K]`, `&StringCacheKey{}`, `&IntCacheKey{}` | `KeyCodec[K]` with `Encode`/`Decode`, `StringKeyCodec{}`, `IntKeyCodec{}`; `MarshallAll`/`UnmarshalAll` are gone |
-| `NewLocalCache(options)` panicked without a key | `NewLocal(options) (*Local, error)`; options field `CacheKey` is now `KeyCodec` |
+| `NewLocalCache(options)` panicked without a key | `NewLocal(options) (*Local, error)`; options field `CacheKey` is now `KeyCodec`; new `Clear()` |
 | `LocalCache.Load() ([]CacheEntry, error)` | `Local.Entries() []Entry` with `Value V` instead of `*V` |
 | `LocalCache.Contains` saw expired entries | `Contains` ignores expired entries |
-| `NewRedisStorageBackend` built its own client from `RedisOptions` and instrumented it with OpenTelemetry | `redisadapter.NewStore` takes your `*redis.Client`; instrument it yourself; `Close` no longer closes the client |
+| `NewRedisStorageBackend(&RedisStorageBackendOptions{...})` built its own client from `RedisOptions` and instrumented it with OpenTelemetry | `redisadapter.New(&redisadapter.Options{...})` takes your `*redis.Client`; instrument it yourself; `Close` no longer closes the client |
+| `KeyPrefix` optional | `KeyPrefix` required |
 | `PubSub: true` + `PubSubChannelName` | `EventChannel` (empty disables events) |
 | `Get` returned `(*V, error)` with `redis.Nil` on a miss | `Get` returns `(V, error)` with `cache.ErrNotFound` on a miss; Redis errors are no longer wrapped |
 | `Ttl` | `TTL`: zero for no expiry, `ErrNotFound` for a missing key |
 | `AddCallback`, `CacheEvent{Entry, Type, KeyPrefix}` | `OnEvent`, `Event{Type, Key, Value, Prefix}` plus `EventReset`; the wire format changed, so v0 and v1 stores must not share an event channel |
-| `NewSynchronizedCache` with `StorageBackend`, `Preload`, `Tracer`, `AsyncTimeout` | `NewSynchronized` with `Backend`; call `Preload(ctx)`; tracing via your Redis client; background writes run without the caller's cancellation, bounded by the client's timeouts |
+| `NewSynchronizedCache` with `StorageBackend`, `CacheKey`, `Preload`, `Tracer`, `AsyncTimeout` | `NewSynchronized` with `Backend` (its `KeyCodec()` is used); call `Preload(ctx)`; tracing via your Redis client; `AsyncTimeout` bounds each background write, which runs without the caller's cancellation |
 | `SynchronizedCache.Get` returned `(*V, bool)` and hid backend errors | `Get` returns `(V, error)` |
-| `RemoteAsync` | `AsyncWrites`, plus `Close()` to wait for background writes |
-| `NewLeaderElection(LeaderElectionOptions{...})` | `leader.NewElection(&leader.ElectionOptions{...})` |
+| `RemoteAsync` (one goroutine per write, unordered) | `AsyncWrites` (one ordered, bounded queue: `AsyncQueueSize`), plus `Close(ctx)` to drain it |
+| `NewLeaderElection(LeaderElectionOptions{...})` | `leader.New(&leader.Options{...})` |
 | `PubSubChannel` | `EventChannel` |
+| `OnElected func(ctx)` | `OnElected func(ctx, fencingToken int64)` |
 | `Stop() error` | `Stop(ctx) error`, now waits for `OnElected` to return and returns the release error |
 | `RenewInterval` below `LeaseDuration` | `RenewInterval` below half of `LeaseDuration` |
 | errors printed with the `log` package | optional `Logger *slog.Logger` in every options struct that needs one |

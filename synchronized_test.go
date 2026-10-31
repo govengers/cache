@@ -1,10 +1,8 @@
 package cache_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"log/slog"
 	"testing"
 	"time"
 
@@ -19,13 +17,21 @@ func TestMain(m *testing.M) {
 
 var errBackend = errors.New("backend failed")
 
-// fakeBackend is a Backend whose Get, Set and Load run the functions a test sets. Every other
-// method, and an unset function, fails with errBackend, so a successful read proves a local hit.
+// fakeBackend is a Backend whose methods run the functions a test sets. TTL, Contains and an
+// unset function fail with errBackend, so a successful Get proves a local hit.
 type fakeBackend struct {
-	get     func(ctx context.Context, key string) (string, error)
-	set     func(ctx context.Context, key, value string) error
-	load    func(ctx context.Context) ([]cache.Entry[string, string], error)
-	handler func(cache.Event[string, string])
+	keyCodec     cache.KeyCodec[string]
+	get          func(ctx context.Context, key string) (string, error)
+	set          func(ctx context.Context, key, value string) error
+	remove       func(ctx context.Context, key string) error
+	removePrefix func(ctx context.Context, prefix string) error
+	load         func(ctx context.Context) ([]cache.Entry[string, string], error)
+	handler      func(cache.Event[string, string])
+	unregistered int
+}
+
+func newFakeBackend() *fakeBackend {
+	return &fakeBackend{keyCodec: cache.StringKeyCodec{}}
 }
 
 func (b *fakeBackend) Get(ctx context.Context, key string) (string, error) {
@@ -46,12 +52,18 @@ func (b *fakeBackend) Set(ctx context.Context, key, value string) error {
 	return b.set(ctx, key, value)
 }
 
-func (b *fakeBackend) Remove(context.Context, string) error {
-	return errBackend
+func (b *fakeBackend) Remove(ctx context.Context, key string) error {
+	if b.remove == nil {
+		return errBackend
+	}
+	return b.remove(ctx, key)
 }
 
-func (b *fakeBackend) RemovePrefix(context.Context, string) error {
-	return errBackend
+func (b *fakeBackend) RemovePrefix(ctx context.Context, prefix string) error {
+	if b.removePrefix == nil {
+		return errBackend
+	}
+	return b.removePrefix(ctx, prefix)
 }
 
 func (b *fakeBackend) Contains(context.Context, string) (bool, error) {
@@ -65,8 +77,13 @@ func (b *fakeBackend) Load(ctx context.Context) ([]cache.Entry[string, string], 
 	return b.load(ctx)
 }
 
-func (b *fakeBackend) OnEvent(handler func(cache.Event[string, string])) {
+func (b *fakeBackend) KeyCodec() cache.KeyCodec[string] {
+	return b.keyCodec
+}
+
+func (b *fakeBackend) OnEvent(handler func(cache.Event[string, string])) func() {
 	b.handler = handler
+	return func() { b.unregistered++ }
 }
 
 func (b *fakeBackend) emit(event cache.Event[string, string]) {
@@ -75,16 +92,14 @@ func (b *fakeBackend) emit(event cache.Event[string, string]) {
 
 func newSynchronized(t *testing.T, options *cache.SynchronizedOptions[string, string]) *cache.Synchronized[string, string] {
 	t.Helper()
-	if options.KeyCodec == nil {
-		options.KeyCodec = cache.StringKeyCodec{}
-	}
 	synchronized, err := cache.NewSynchronized(options)
 	require.NoError(t, err)
-	t.Cleanup(synchronized.Close)
+	t.Cleanup(func() { require.NoError(t, synchronized.Close(context.Background())) })
 	return synchronized
 }
 
-// requireLocal fails unless key holds value locally; the fake backend fails every Get.
+// requireLocal fails unless key holds value locally; the fake backend fails every Get it has no
+// function for.
 func requireLocal(t *testing.T, synchronized *cache.Synchronized[string, string], key, value string) {
 	t.Helper()
 	stored, err := synchronized.Get(t.Context(), key)
@@ -104,10 +119,12 @@ func TestNewSynchronizedRejectsInvalidOptions(t *testing.T) {
 		options *cache.SynchronizedOptions[string, string]
 	}{
 		{name: "nil options", options: nil},
-		{name: "missing Backend", options: &cache.SynchronizedOptions[string, string]{KeyCodec: cache.StringKeyCodec{}}},
-		{name: "missing KeyCodec", options: &cache.SynchronizedOptions[string, string]{Backend: &fakeBackend{}}},
-		{name: "negative LocalTTL", options: &cache.SynchronizedOptions[string, string]{Backend: &fakeBackend{}, KeyCodec: cache.StringKeyCodec{}, LocalTTL: -time.Second}},
-		{name: "negative LocalSize", options: &cache.SynchronizedOptions[string, string]{Backend: &fakeBackend{}, KeyCodec: cache.StringKeyCodec{}, LocalSize: -1}},
+		{name: "missing Backend", options: &cache.SynchronizedOptions[string, string]{}},
+		{name: "Backend without KeyCodec", options: &cache.SynchronizedOptions[string, string]{Backend: &fakeBackend{}}},
+		{name: "negative LocalTTL", options: &cache.SynchronizedOptions[string, string]{Backend: newFakeBackend(), LocalTTL: -time.Second}},
+		{name: "negative LocalSize", options: &cache.SynchronizedOptions[string, string]{Backend: newFakeBackend(), LocalSize: -1}},
+		{name: "negative AsyncQueueSize", options: &cache.SynchronizedOptions[string, string]{Backend: newFakeBackend(), AsyncQueueSize: -1}},
+		{name: "negative AsyncTimeout", options: &cache.SynchronizedOptions[string, string]{Backend: newFakeBackend(), AsyncTimeout: -time.Second}},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -150,14 +167,14 @@ func TestSynchronizedReturnsBackendErrors(t *testing.T) {
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: &fakeBackend{}})
+			synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: newFakeBackend()})
 			require.ErrorIs(t, testCase.operation(t.Context(), synchronized), errBackend)
 		})
 	}
 }
 
 func TestSynchronizedFailedWriteKeepsTheLocalCache(t *testing.T) {
-	backend := &fakeBackend{}
+	backend := newFakeBackend()
 	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
 	backend.emit(cache.Event[string, string]{Type: cache.EventSet, Key: "kept", Value: "value"})
 
@@ -167,6 +184,26 @@ func TestSynchronizedFailedWriteKeepsTheLocalCache(t *testing.T) {
 
 	requireNotLocal(t, synchronized, "key")
 	requireLocal(t, synchronized, "kept", "value")
+}
+
+func TestSynchronizedWritesChangeTheLocalCache(t *testing.T) {
+	backend := newFakeBackend()
+	backend.set = func(context.Context, string, string) error { return nil }
+	backend.remove = func(context.Context, string) error { return nil }
+	backend.removePrefix = func(context.Context, string) error { return nil }
+	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
+	ctx := t.Context()
+	for _, key := range []string{"user:1", "user:2", "user:3", "group:1"} {
+		require.NoError(t, synchronized.Set(ctx, key, key+" value"))
+	}
+
+	require.NoError(t, synchronized.Remove(ctx, "user:1"))
+	require.NoError(t, synchronized.RemovePrefix(ctx, "user:"))
+
+	requireLocal(t, synchronized, "group:1", "group:1 value")
+	for _, key := range []string{"user:1", "user:2", "user:3"} {
+		requireNotLocal(t, synchronized, key)
+	}
 }
 
 func TestSynchronizedAppliesBackendEvents(t *testing.T) {
@@ -195,10 +232,15 @@ func TestSynchronizedAppliesBackendEvents(t *testing.T) {
 			event:     cache.Event[string, string]{Type: cache.EventReset},
 			remaining: map[string]string{},
 		},
+		{
+			name:      "unknown type is ignored",
+			event:     cache.Event[string, string]{Type: cache.EventType(99), Key: "user:1"},
+			remaining: map[string]string{"user:1": "one", "user:2": "two", "group:1": "group"},
+		},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			backend := &fakeBackend{}
+			backend := newFakeBackend()
 			synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
 			initial := map[string]string{"user:1": "one", "user:2": "two", "group:1": "group"}
 			for key, value := range initial {
@@ -218,154 +260,174 @@ func TestSynchronizedAppliesBackendEvents(t *testing.T) {
 	}
 }
 
-func TestSynchronizedGetDropsAReadOvertakenByAChange(t *testing.T) {
-	getStarted := make(chan struct{})
-	releaseGet := make(chan struct{})
-	backend := &fakeBackend{get: func(context.Context, string) (string, error) {
-		close(getStarted)
-		<-releaseGet
-		return "stale", nil
-	}}
-	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
-
-	read := make(chan string)
-	go func() {
-		value, _ := synchronized.Get(context.Background(), "key")
-		read <- value
-	}()
-	<-getStarted
-	backend.emit(cache.Event[string, string]{Type: cache.EventSet, Key: "key", Value: "fresh"})
-	close(releaseGet)
-
-	require.Equal(t, "stale", <-read, "the caller still gets what it read")
-	requireLocal(t, synchronized, "key", "fresh")
-}
-
-func TestSynchronizedPreloadFillsTheLocalCache(t *testing.T) {
-	backend := &fakeBackend{load: func(context.Context) ([]cache.Entry[string, string], error) {
-		return []cache.Entry[string, string]{{Key: "first", Value: "one"}, {Key: "second", Value: "two"}}, nil
-	}}
-	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
-
-	require.NoError(t, synchronized.Preload(t.Context()))
-
-	requireLocal(t, synchronized, "first", "one")
-	requireLocal(t, synchronized, "second", "two")
-}
-
-func TestSynchronizedPreloadDropsEntriesOvertakenByAChange(t *testing.T) {
-	backend := &fakeBackend{}
-	backend.load = func(context.Context) ([]cache.Entry[string, string], error) {
-		backend.emit(cache.Event[string, string]{Type: cache.EventSet, Key: "changed", Value: "fresh"})
-		return []cache.Entry[string, string]{{Key: "changed", Value: "stale"}, {Key: "other", Value: "value"}}, nil
-	}
-	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
-
-	require.NoError(t, synchronized.Preload(t.Context()))
-
-	requireLocal(t, synchronized, "changed", "fresh")
-	requireNotLocal(t, synchronized, "other")
-}
-
-func TestSynchronizedAsyncSetChangesLocallyAndWritesInTheBackground(t *testing.T) {
-	setStarted := make(chan struct{})
-	releaseSet := make(chan struct{})
-	backend := &fakeBackend{set: func(ctx context.Context, _, _ string) error {
-		close(setStarted)
-		<-releaseSet
-		return ctx.Err()
-	}}
-	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend, AsyncWrites: true})
-
-	ctx, cancel := context.WithCancel(t.Context())
-	require.NoError(t, synchronized.Set(ctx, "key", "value"))
-	cancel()
-	<-setStarted
-	requireLocal(t, synchronized, "key", "value")
-
-	closed := make(chan struct{})
-	go func() {
-		synchronized.Close()
-		close(closed)
-	}()
-	require.Never(t, func() bool {
-		select {
-		case <-closed:
-			return true
-		default:
-			return false
-		}
-	}, 20*time.Millisecond, time.Millisecond, "Close waits for the background write")
-
-	close(releaseSet)
-	<-closed
-	requireLocal(t, synchronized, "key", "value") // the write ignored the caller's cancellation
-}
-
-func TestSynchronizedAsyncWriteFailureIsLogged(t *testing.T) {
+func TestEventTypeString(t *testing.T) {
 	testCases := []struct {
-		name    string
-		write   func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error
-		message string
+		eventType cache.EventType
+		name      string
 	}{
-		{
-			name: "set drops the local copy",
-			write: func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
-				return synchronized.Set(ctx, "key", "new")
-			},
-			message: "cache: background set failed",
-		},
-		{
-			name: "remove",
-			write: func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
-				return synchronized.Remove(ctx, "key")
-			},
-			message: "cache: background remove failed",
-		},
-		{
-			name: "remove prefix",
-			write: func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
-				return synchronized.RemovePrefix(ctx, "k")
-			},
-			message: "cache: background remove prefix failed",
-		},
+		{eventType: cache.EventSet, name: "set"},
+		{eventType: cache.EventRemove, name: "remove"},
+		{eventType: cache.EventRemovePrefix, name: "remove prefix"},
+		{eventType: cache.EventReset, name: "reset"},
+		{eventType: cache.EventType(0), name: "EventType(0)"},
+		{eventType: cache.EventType(42), name: "EventType(42)"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			var logs bytes.Buffer
-			backend := &fakeBackend{}
-			synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{
-				Backend:     backend,
-				AsyncWrites: true,
-				Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
-			})
-			backend.emit(cache.Event[string, string]{Type: cache.EventSet, Key: "key", Value: "old"})
-
-			require.NoError(t, testCase.write(t.Context(), synchronized))
-			synchronized.Close()
-
-			requireNotLocal(t, synchronized, "key")
-			require.Contains(t, logs.String(), testCase.message)
-			require.Contains(t, logs.String(), errBackend.Error())
+			require.Equal(t, testCase.name, testCase.eventType.String())
 		})
 	}
 }
 
-func TestSynchronizedAsyncWritePanicIsRecoveredAndLogged(t *testing.T) {
-	var logs bytes.Buffer
-	backend := &fakeBackend{set: func(context.Context, string, string) error {
-		panic("backend exploded")
-	}}
-	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{
-		Backend:     backend,
-		AsyncWrites: true,
-		Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
-	})
+func TestSynchronizedCloseUnregistersFromTheBackendOnce(t *testing.T) {
+	backend := newFakeBackend()
+	synchronized, err := cache.NewSynchronized(&cache.SynchronizedOptions[string, string]{Backend: backend})
+	require.NoError(t, err)
 
-	require.NoError(t, synchronized.Set(t.Context(), "key", "value"))
-	synchronized.Close()
+	require.NoError(t, synchronized.Close(t.Context()))
+	require.NoError(t, synchronized.Close(t.Context()))
 
-	require.Contains(t, logs.String(), "cache: background set panicked")
-	require.Contains(t, logs.String(), "backend exploded")
-	requireNotLocal(t, synchronized, "key")
+	require.Equal(t, 1, backend.unregistered)
+}
+
+// changesDuringRead are changes a test applies while a read from the backend is in flight, and
+// whether the read value is still kept afterwards. The read is of "user:1".
+var changesDuringRead = []struct {
+	name   string
+	events []cache.Event[string, string]
+	kept   bool
+}{
+	{name: "no change", kept: true},
+	{
+		name:   "a change of another key",
+		events: []cache.Event[string, string]{{Type: cache.EventSet, Key: "user:2", Value: "other"}, {Type: cache.EventRemove, Key: "group:1"}},
+		kept:   true,
+	},
+	{name: "a set of the key", events: []cache.Event[string, string]{{Type: cache.EventSet, Key: "user:1", Value: "fresh"}}},
+	{name: "a removal of the key", events: []cache.Event[string, string]{{Type: cache.EventRemove, Key: "user:1"}}},
+	{name: "a prefix removal covering the key", events: []cache.Event[string, string]{{Type: cache.EventRemovePrefix, Prefix: "user:"}}},
+	{name: "a prefix removal not covering the key", events: []cache.Event[string, string]{{Type: cache.EventRemovePrefix, Prefix: "group:"}}},
+	{name: "a reset", events: []cache.Event[string, string]{{Type: cache.EventReset}}},
+}
+
+// localAfterChanges is what the local cache holds for "user:1" after the changes alone.
+func localAfterChanges(events []cache.Event[string, string]) (string, bool) {
+	for _, event := range events {
+		if event.Type == cache.EventSet && event.Key == "user:1" {
+			return event.Value, true
+		}
+	}
+	return "", false
+}
+
+func requireReadOutcome(t *testing.T, synchronized *cache.Synchronized[string, string], read string, events []cache.Event[string, string], kept bool) {
+	t.Helper()
+	switch value, changed := localAfterChanges(events); {
+	case kept:
+		requireLocal(t, synchronized, "user:1", read)
+	case changed:
+		requireLocal(t, synchronized, "user:1", value)
+	default:
+		requireNotLocal(t, synchronized, "user:1")
+	}
+}
+
+func TestSynchronizedGetKeepsAReadUnlessItsKeyChangedMeanwhile(t *testing.T) {
+	for _, testCase := range changesDuringRead {
+		t.Run(testCase.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			backend.get = func(context.Context, string) (string, error) {
+				for _, event := range testCase.events {
+					backend.emit(event)
+				}
+				backend.get = nil
+				return "read", nil
+			}
+			synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
+
+			value, err := synchronized.Get(t.Context(), "user:1")
+			require.NoError(t, err)
+			require.Equal(t, "read", value, "the caller gets what was read either way")
+
+			requireReadOutcome(t, synchronized, "read", testCase.events, testCase.kept)
+		})
+	}
+}
+
+func TestSynchronizedSetKeepsItsValueUnlessTheKeyChangedMeanwhile(t *testing.T) {
+	for _, testCase := range changesDuringRead {
+		t.Run(testCase.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			backend.set = func(context.Context, string, string) error {
+				for _, event := range testCase.events {
+					backend.emit(event)
+				}
+				return nil
+			}
+			synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
+
+			require.NoError(t, synchronized.Set(t.Context(), "user:1", "written"))
+
+			requireReadOutcome(t, synchronized, "written", testCase.events, testCase.kept)
+		})
+	}
+}
+
+func TestSynchronizedPreloadSkipsEntriesChangedMeanwhile(t *testing.T) {
+	testCases := []struct {
+		name   string
+		events []cache.Event[string, string]
+		local  map[string]string // the local cache afterwards; a missing key is not held
+	}{
+		{
+			name:  "no change",
+			local: map[string]string{"user:1": "one", "user:2": "two", "group:1": "group"},
+		},
+		{
+			name:   "a set of one key",
+			events: []cache.Event[string, string]{{Type: cache.EventSet, Key: "user:1", Value: "fresh"}},
+			local:  map[string]string{"user:1": "fresh", "user:2": "two", "group:1": "group"},
+		},
+		{
+			name:   "a removal of one key",
+			events: []cache.Event[string, string]{{Type: cache.EventRemove, Key: "user:2"}},
+			local:  map[string]string{"user:1": "one", "group:1": "group"},
+		},
+		{
+			name:   "a prefix removal",
+			events: []cache.Event[string, string]{{Type: cache.EventRemovePrefix, Prefix: "user:"}},
+			local:  map[string]string{"group:1": "group"},
+		},
+		{
+			name:   "a reset",
+			events: []cache.Event[string, string]{{Type: cache.EventReset}},
+			local:  map[string]string{},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			backend.load = func(context.Context) ([]cache.Entry[string, string], error) {
+				for _, event := range testCase.events {
+					backend.emit(event)
+				}
+				return []cache.Entry[string, string]{
+					{Key: "user:1", Value: "one"},
+					{Key: "user:2", Value: "two"},
+					{Key: "group:1", Value: "group"},
+				}, nil
+			}
+			synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
+
+			require.NoError(t, synchronized.Preload(t.Context()))
+
+			for _, key := range []string{"user:1", "user:2", "group:1"} {
+				if value, held := testCase.local[key]; held {
+					requireLocal(t, synchronized, key, value)
+				} else {
+					requireNotLocal(t, synchronized, key)
+				}
+			}
+		})
+	}
 }

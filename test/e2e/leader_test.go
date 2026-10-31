@@ -28,14 +28,14 @@ func mustEncode(t *testing.T, value product) []byte {
 
 func newElection(t *testing.T, client *redis.Client, instanceID string, elected chan<- string) *leader.Election {
 	t.Helper()
-	election, err := leader.NewElection(&leader.ElectionOptions{
+	election, err := leader.New(&leader.Options{
 		Client:        client,
 		LockKey:       "e2e:" + t.Name() + ":lock",
 		InstanceID:    instanceID,
 		LeaseDuration: 10 * time.Second,
 		RetryInterval: 10 * time.Second, // a takeover within the deadline needs the resignation event
 		EventChannel:  "e2e:" + t.Name() + ":resignations",
-		OnElected:     func(context.Context) { elected <- instanceID },
+		OnElected:     func(context.Context, int64) { elected <- instanceID },
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, election.Stop(context.WithoutCancel(t.Context()))) })
@@ -51,7 +51,8 @@ func TestAFollowerTakesOverAsSoonAsTheLeaderResigns(t *testing.T) {
 	require.Equal(t, "first", <-elected)
 	firstToken := first.FencingToken()
 	require.NoError(t, second.Start(t.Context()))
-	waitUntilSubscribed(t, newClient(t), "e2e:"+t.Name()+":resignations")
+	// Both elections listen for resignations: the second must hear the first's.
+	waitForSubscribers(t, newClient(t), "e2e:"+t.Name()+":resignations", 2)
 	require.False(t, second.IsLeader())
 
 	require.NoError(t, first.Stop(t.Context()))
@@ -66,12 +67,12 @@ func TestAFollowerTakesOverAsSoonAsTheLeaderResigns(t *testing.T) {
 	require.Greater(t, second.FencingToken(), firstToken)
 }
 
-// waitUntilSubscribed returns once someone listens on channel, so nothing the test publishes
-// there is lost.
-func waitUntilSubscribed(t *testing.T, client *redis.Client, channel string) {
+// waitForSubscribers returns once count subscriptions listen on channel, so nothing the test
+// publishes there is lost.
+func waitForSubscribers(t *testing.T, client *redis.Client, channel string, count int64) {
 	t.Helper()
 	require.Eventually(t, func() bool {
 		subscribers, err := client.PubSubNumSub(t.Context(), channel).Result()
-		return err == nil && subscribers[channel] > 0
+		return err == nil && subscribers[channel] >= count
 	}, propagationDeadline, 10*time.Millisecond)
 }

@@ -17,8 +17,8 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// StoreOptions configures NewStore.
-type StoreOptions[K comparable] struct {
+// Options configures New.
+type Options[K comparable] struct {
 	// Client is the Redis connection: redis.NewClient for one server, redis.NewFailoverClient
 	// behind Sentinel. Redis Cluster is not supported. The caller creates it (and instruments it,
 	// for example with redisotel), and closes it after Store.Close. Required.
@@ -27,19 +27,22 @@ type StoreOptions[K comparable] struct {
 	KeyCodec cache.KeyCodec[K]
 	// KeyPrefix namespaces the keys: a key is stored as "<KeyPrefix>:<encoded key>". Load and
 	// RemovePrefix only see keys in the namespace, so give every Store sharing a database its
-	// own prefix. Empty: keys are stored as they are encoded, and Load reads the whole database.
+	// own prefix. Required, so that clearing a cache never clears the database.
 	KeyPrefix string
-	// TTL is how long Redis keeps an entry after its last write. Zero: forever.
+	// TTL is how long Redis keeps an entry after its last write, rounded up to whole
+	// milliseconds. Zero: forever.
 	TTL time.Duration
 	// EventChannel is the Pub/Sub channel this store publishes its changes on and receives the
-	// changes of every store sharing it from. NewStore then starts a goroutine that Close stops.
+	// changes of every store sharing it from. New then starts a goroutine that Close stops.
 	// Events are delivered at most once: changes made while no subscription is up are missed, so
 	// handlers receive cache.EventReset each time the subscription is established, the first
 	// time included. Empty: no events.
 	EventChannel string
 	// HeartbeatInterval is how often the store checks that its subscription still receives what
-	// is published on the primary. A subscription that stays on a former primary after a
-	// Sentinel failover, or on a dead connection, is renewed within three intervals. Zero: 5s.
+	// is published on the primary, and that the primary is still the same server. A
+	// subscription left on a former primary after a Sentinel failover is renewed at the next
+	// heartbeat, one on a dead connection after three to four intervals. Each heartbeat is one
+	// PUBLISH and one INFO on the primary. Zero: 5s.
 	HeartbeatInterval time.Duration
 	// ScanCount is the COUNT hint of the SCAN calls of Load and RemovePrefix. Zero: the Redis
 	// default.
@@ -63,8 +66,9 @@ type Store[K comparable, V any] struct {
 	scanCount         int64
 	logger            *slog.Logger
 
-	handlersMutex sync.RWMutex
-	handlers      []func(cache.Event[K, V])
+	handlersMutex sync.Mutex
+	handlers      []registeredHandler[K, V]
+	nextHandlerID uint64
 
 	stopReceiving     context.CancelFunc
 	receiving         sync.WaitGroup
@@ -72,17 +76,17 @@ type Store[K comparable, V any] struct {
 	firstSubscription sync.Once
 }
 
-// NewStore returns a Store, and starts receiving events if options.EventChannel is set. It
-// returns an error if Client or KeyCodec is missing or TTL, ScanCount or HeartbeatInterval is
+// New returns a Store, and starts receiving events if options.EventChannel is set. It
+// returns an error if Client, KeyCodec or KeyPrefix is missing or TTL, ScanCount or HeartbeatInterval is
 // negative.
-func NewStore[K comparable, V any](options *StoreOptions[K]) (*Store[K, V], error) {
+func New[K comparable, V any](options *Options[K]) (*Store[K, V], error) {
 	if err := validate(options); err != nil {
 		return nil, err
 	}
 	store := &Store[K, V]{
 		client:            options.Client,
 		keyCodec:          options.KeyCodec,
-		namespace:         namespace(options.KeyPrefix),
+		namespace:         options.KeyPrefix + ":",
 		ttl:               options.TTL,
 		eventChannel:      options.EventChannel,
 		heartbeatInterval: cmp.Or(options.HeartbeatInterval, defaultHeartbeatInterval),
@@ -97,21 +101,14 @@ func NewStore[K comparable, V any](options *StoreOptions[K]) (*Store[K, V], erro
 	return store, nil
 }
 
-func validate[K comparable](options *StoreOptions[K]) error {
-	if options == nil || options.Client == nil || options.KeyCodec == nil {
-		return errors.New("redisadapter: StoreOptions.Client and KeyCodec are required")
+func validate[K comparable](options *Options[K]) error {
+	if options == nil || options.Client == nil || options.KeyCodec == nil || options.KeyPrefix == "" {
+		return errors.New("redisadapter: Options.Client, KeyCodec and KeyPrefix are required")
 	}
 	if options.TTL < 0 || options.ScanCount < 0 || options.HeartbeatInterval < 0 {
-		return fmt.Errorf("redisadapter: StoreOptions.TTL %s, ScanCount %d and HeartbeatInterval %s must not be negative", options.TTL, options.ScanCount, options.HeartbeatInterval)
+		return fmt.Errorf("redisadapter: Options.TTL %s, ScanCount %d and HeartbeatInterval %s must not be negative", options.TTL, options.ScanCount, options.HeartbeatInterval)
 	}
 	return nil
-}
-
-func namespace(keyPrefix string) string {
-	if keyPrefix == "" {
-		return ""
-	}
-	return keyPrefix + ":"
 }
 
 // Get returns the value of key, or an error matching cache.ErrNotFound.
@@ -158,36 +155,93 @@ func lifetime(redisKey string, remaining time.Duration) (time.Duration, error) {
 	}
 }
 
+// The mutations publish their event in the same script, so events reach subscribers in the
+// order Redis applied the changes, and no change is applied without its event. An empty
+// channel publishes nothing.
+var (
+	// KEYS: key. ARGV: value, ttl in milliseconds (0: none), channel, event.
+	setScript = redis.NewScript(`
+if ARGV[2] == '0' then
+	redis.call('SET', KEYS[1], ARGV[1])
+else
+	redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+end
+if ARGV[3] ~= '' then
+	redis.call('PUBLISH', ARGV[3], ARGV[4])
+end
+return 1
+`)
+
+	// KEYS: key. ARGV: channel, event.
+	removeScript = redis.NewScript(`
+redis.call('DEL', KEYS[1])
+if ARGV[1] ~= '' then
+	redis.call('PUBLISH', ARGV[1], ARGV[2])
+end
+return 1
+`)
+)
+
 // Set stores value under key with the store's TTL and publishes the change.
 func (s *Store[K, V]) Set(ctx context.Context, key K, value V) error {
-	encoded, err := msgpack.Marshal(value)
+	encodedValue, err := msgpack.Marshal(value)
 	if err != nil {
 		return opaque.Error("redisadapter: encode "+s.redisKey(key), err)
 	}
-	if err := s.client.Set(ctx, s.redisKey(key), encoded, s.ttl).Err(); err != nil {
+	event, err := encodeEvent(&eventMessage{Type: cache.EventSet, Key: s.keyCodec.Encode(key), Value: encodedValue})
+	if err != nil {
 		return opaque.Error("redisadapter: set "+s.redisKey(key), err)
 	}
-	return s.publish(ctx, &eventMessage[K, V]{Type: cache.EventSet, Key: key, Value: value})
+	arguments := []any{encodedValue, s.ttlMilliseconds(), s.eventChannel, event}
+	if err := setScript.Run(ctx, s.client, []string{s.redisKey(key)}, arguments...).Err(); err != nil {
+		return opaque.Error("redisadapter: set "+s.redisKey(key), err)
+	}
+	return nil
+}
+
+// ttlMilliseconds rounds the TTL up to whole milliseconds, Redis's precision, so an entry never
+// expires before its TTL; zero stays zero, no expiry.
+func (s *Store[K, V]) ttlMilliseconds() int64 {
+	return int64((s.ttl + time.Millisecond - 1) / time.Millisecond)
 }
 
 // Remove deletes key and publishes the change.
 func (s *Store[K, V]) Remove(ctx context.Context, key K) error {
-	if err := s.client.Del(ctx, s.redisKey(key)).Err(); err != nil {
+	event, err := encodeEvent(&eventMessage{Type: cache.EventRemove, Key: s.keyCodec.Encode(key)})
+	if err != nil {
 		return opaque.Error("redisadapter: remove "+s.redisKey(key), err)
 	}
-	return s.publish(ctx, &eventMessage[K, V]{Type: cache.EventRemove, Key: key})
+	if err := removeScript.Run(ctx, s.client, []string{s.redisKey(key)}, s.eventChannel, event).Err(); err != nil {
+		return opaque.Error("redisadapter: remove "+s.redisKey(key), err)
+	}
+	return nil
 }
 
 // RemovePrefix deletes every key whose encoding starts with prefix and publishes the change. An
-// empty prefix clears the namespace. Keys written while it runs may survive.
+// empty prefix clears the namespace. Keys written while it runs may survive. The change is
+// published even when the removal fails part way, because some keys may be gone already.
 func (s *Store[K, V]) RemovePrefix(ctx context.Context, prefix string) error {
-	err := s.scan(ctx, prefix, func(redisKeys []string) error {
+	removeError := s.scan(ctx, prefix, func(redisKeys []string) error {
 		return s.client.Unlink(ctx, redisKeys...).Err()
 	})
-	if err != nil {
-		return opaque.Error("redisadapter: remove prefix "+s.namespace+prefix, err)
+	if removeError != nil {
+		removeError = opaque.Error("redisadapter: remove prefix "+s.namespace+prefix, removeError)
 	}
-	return s.publish(ctx, &eventMessage[K, V]{Type: cache.EventRemovePrefix, Prefix: prefix})
+	return errors.Join(removeError, s.publish(ctx, &eventMessage{Type: cache.EventRemovePrefix, Prefix: prefix}))
+}
+
+func (s *Store[K, V]) publish(ctx context.Context, message *eventMessage) error {
+	if s.eventChannel == "" {
+		return nil
+	}
+	event, err := encodeEvent(message)
+	if err != nil {
+		return opaque.Error("redisadapter: publish on "+s.eventChannel, err)
+	}
+	if err := s.client.Publish(ctx, s.eventChannel, event).Err(); err != nil {
+		return opaque.Error("redisadapter: publish on "+s.eventChannel, err)
+	}
+	return nil
 }
 
 // Contains reports whether key exists.
@@ -199,21 +253,14 @@ func (s *Store[K, V]) Contains(ctx context.Context, key K) (bool, error) {
 	return count == 1, nil
 }
 
-// OnEvent registers handler for every change published on the event channel, including this
-// store's own. Handlers run one at a time on the receiving goroutine and must not block; a
-// panicking handler is logged and skipped. Without an event channel, handlers are never called.
-func (s *Store[K, V]) OnEvent(handler func(cache.Event[K, V])) {
-	s.handlersMutex.Lock()
-	defer s.handlersMutex.Unlock()
-	s.handlers = append(s.handlers, handler)
-}
-
 // ErrNoEventChannel is returned by AwaitSubscription on a store without an EventChannel.
 var ErrNoEventChannel = errors.New("redisadapter: the store has no EventChannel")
 
-// AwaitSubscription returns once the store receives events, or with ctx's error. Call it before
-// cache.Synchronized.Preload: the EventReset of the first subscription would drop what was
-// preloaded before it. It returns ErrNoEventChannel without an EventChannel.
+// AwaitSubscription returns once the store's first subscription to the event channel was
+// established, or with ctx's error. It does not report later reconnects, which deliver their own
+// cache.EventReset. Call it before cache.Synchronized.Preload: the EventReset of the first
+// subscription would drop what was preloaded before it. It returns ErrNoEventChannel without an
+// EventChannel.
 func (s *Store[K, V]) AwaitSubscription(ctx context.Context) error {
 	if s.eventChannel == "" {
 		return ErrNoEventChannel
@@ -231,6 +278,11 @@ func (s *Store[K, V]) AwaitSubscription(ctx context.Context) error {
 func (s *Store[K, V]) Close() {
 	s.stopReceiving()
 	s.receiving.Wait()
+}
+
+// KeyCodec returns the codec of Options.KeyCodec.
+func (s *Store[K, V]) KeyCodec() cache.KeyCodec[K] {
+	return s.keyCodec
 }
 
 func (s *Store[K, V]) redisKey(key K) string {

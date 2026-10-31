@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +25,9 @@ const (
 	testLease        = 300 * time.Millisecond
 	waitTimeout      = 2 * time.Second
 	pollInterval     = 5 * time.Millisecond
+	// deadlineSlack is how much later than its deadline a leader may step down in tests running
+	// under the race detector.
+	deadlineSlack = 50 * time.Millisecond
 )
 
 func TestMain(m *testing.M) {
@@ -37,21 +42,21 @@ func newClient(t *testing.T, miniRedis *miniredis.Miniredis) *redis.Client {
 	return client
 }
 
-func testOptions(client *redis.Client) *ElectionOptions {
-	return &ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: testLease}
+func testOptions(client *redis.Client) *Options {
+	return &Options{Client: client, LockKey: testLockKey, LeaseDuration: testLease}
 }
 
 // newElection returns an election that is stopped when the test ends, before its client is
 // closed.
-func newElection(t *testing.T, options *ElectionOptions) *Election {
+func newElection(t *testing.T, options *Options) *Election {
 	t.Helper()
-	election, err := NewElection(options)
+	election, err := New(options)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = election.Stop(context.Background()) })
 	return election
 }
 
-func startElection(t *testing.T, options *ElectionOptions) *Election {
+func startElection(t *testing.T, options *Options) *Election {
 	t.Helper()
 	election := newElection(t, options)
 	require.NoError(t, election.Start(context.Background()))
@@ -75,6 +80,14 @@ func receive[T any](t *testing.T, channel <-chan T) T {
 	}
 }
 
+// requireSteppedDownInTime checks that a leader stepped down one RenewInterval before the lease
+// of its last successful renewal may expire: not later, and not at the following renewal tick.
+func requireSteppedDownInTime(t *testing.T, options *Options, lastRenewal, demotedAt time.Time) {
+	t.Helper()
+	leadUntil := lastRenewal.Add(options.LeaseDuration - options.RenewInterval)
+	require.WithinDuration(t, leadUntil, demotedAt, deadlineSlack)
+}
+
 // logBuffer collects the log output the election writes from its goroutines.
 type logBuffer struct {
 	mutex  sync.Mutex
@@ -95,6 +108,20 @@ func (b *logBuffer) contains(text string) bool {
 
 func (b *logBuffer) logger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(b, nil))
+}
+
+// panickingHandler panics on the record whose message is trigger, which puts a panic on the
+// goroutine that logs it.
+type panickingHandler struct {
+	slog.Handler
+	trigger string
+}
+
+func (h *panickingHandler) Handle(ctx context.Context, record slog.Record) error {
+	if record.Message == h.trigger {
+		panic("injected panic while logging " + record.Message)
+	}
+	return h.Handler.Handle(ctx, record)
 }
 
 // answerRecorder remembers when the last command started that Redis answered without error.
@@ -128,19 +155,87 @@ func (r *answerRecorder) lastAnswerStarted() time.Time {
 	return r.lastAnswer
 }
 
+// interceptor replaces one call of a script; call sends it to Redis.
+type interceptor func(ctx context.Context, call func(ctx context.Context) error) error
+
+// scriptHook lets a test make Redis fail, hang, answer late or panic for the calls of one Lua
+// script, and records when the last call that Redis answered started.
+type scriptHook struct {
+	hash    string
+	answers atomic.Int32
+
+	mutex       sync.Mutex
+	interceptor interceptor
+	lastAnswer  time.Time
+}
+
+func newScriptHook(t *testing.T, client *redis.Client, script *redis.Script) *scriptHook {
+	t.Helper()
+	// A loaded script runs as EVALSHA only, so matching its hash catches every call.
+	require.NoError(t, script.Load(context.Background(), client).Err())
+	hook := &scriptHook{hash: script.Hash()}
+	client.AddHook(hook)
+	return hook
+}
+
+func (h *scriptHook) intercept(replacement interceptor) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	h.interceptor = replacement
+}
+
+func (h *scriptHook) lastAnswerStarted() time.Time {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	return h.lastAnswer
+}
+
+func (h *scriptHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *scriptHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *scriptHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, command redis.Cmder) error {
+		arguments := command.Args()
+		if command.Name() != "evalsha" || len(arguments) < 2 || arguments[1] != h.hash {
+			return next(ctx, command)
+		}
+		call := func(ctx context.Context) error { return next(ctx, command) }
+		h.mutex.Lock()
+		replacement := h.interceptor
+		h.mutex.Unlock()
+		if replacement != nil {
+			return replacement(ctx, call)
+		}
+		started := time.Now()
+		err := call(ctx)
+		if err == nil {
+			h.mutex.Lock()
+			h.lastAnswer = started
+			h.mutex.Unlock()
+			h.answers.Add(1)
+		}
+		return err
+	}
+}
+
 func TestElectionSingleInstanceLeads(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
-	elected := make(chan struct{}, 1)
+	tokens := make(chan int64, 1)
 	options := testOptions(newClient(t, miniRedis))
-	options.OnElected = func(context.Context) { elected <- struct{}{} }
+	options.InstanceID = "instance"
+	options.OnElected = func(_ context.Context, fencingToken int64) { tokens <- fencingToken }
 	election := startElection(t, options)
 
-	receive(t, elected)
+	token := receive(t, tokens)
 	require.True(t, election.IsLeader())
-	require.Positive(t, election.FencingToken())
+	require.Equal(t, int64(1), token)
+	require.Equal(t, token, election.FencingToken())
 	lockValueInRedis, err := miniRedis.Get(testLockKey)
 	require.NoError(t, err)
-	require.Equal(t, lockValue(election.options.InstanceID, election.FencingToken()), lockValueInRedis)
+	require.Equal(t, "instance:"+strconv.FormatInt(token, 10), lockValueInRedis)
 
 	require.NoError(t, election.Stop(context.Background()))
 	require.False(t, election.IsLeader())
@@ -202,12 +297,53 @@ func TestElectionFencingTokenGrowsWithEveryLeadership(t *testing.T) {
 	}
 }
 
+func TestElectionReElectionWaitsForTheEndedOnElected(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	tokens := make(chan int64, 2)
+	demoted := make(chan struct{}, 2)
+	releaseFirst := make(chan struct{})
+	closeReleaseFirst := sync.OnceFunc(func() { close(releaseFirst) })
+	var calls, running, overlaps atomic.Int32
+	options := testOptions(newClient(t, miniRedis))
+	options.RetryInterval = 20 * time.Millisecond
+	options.OnDemoted = func() { demoted <- struct{}{} }
+	options.OnElected = func(ctx context.Context, fencingToken int64) {
+		if running.Add(1) > 1 {
+			overlaps.Add(1)
+		}
+		defer running.Add(-1)
+		tokens <- fencingToken
+		<-ctx.Done()
+		if calls.Add(1) == 1 {
+			<-releaseFirst
+		}
+	}
+	election := startElection(t, options)
+	t.Cleanup(closeReleaseFirst) // runs before the election is stopped
+	firstToken := receive(t, tokens)
+
+	require.NoError(t, miniRedis.Set(testLockKey, "other:99"))
+	receive(t, demoted)
+	miniRedis.Del(testLockKey)
+
+	// The lock is free, but the first OnElected still runs.
+	require.Never(t, election.IsLeader, 5*options.RetryInterval, pollInterval)
+	closeReleaseFirst()
+
+	secondToken := receive(t, tokens)
+	require.Equal(t, int64(1), firstToken)
+	require.Greater(t, secondToken, firstToken)
+	require.Equal(t, secondToken, election.FencingToken())
+	require.NoError(t, election.Stop(context.Background()))
+	require.Zero(t, overlaps.Load(), "two OnElected ran at once")
+}
+
 func TestElectionFollowerTakesOverQuicklyOnResignation(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
 	client := newClient(t, miniRedis)
 	const retryInterval = 10 * time.Second
-	optionsFor := func(instanceID string) *ElectionOptions {
-		return &ElectionOptions{
+	optionsFor := func(instanceID string) *Options {
+		return &Options{
 			Client:        client,
 			LockKey:       testLockKey,
 			InstanceID:    instanceID,
@@ -277,6 +413,99 @@ func TestElectionDemotesAtOnceWhenAnotherInstanceHoldsTheLock(t *testing.T) {
 	require.Equal(t, "other:99", lockValueInRedis)
 }
 
+func TestElectionStepsDownInTimeWhenRenewalsFailFast(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	client := newClient(t, miniRedis)
+	renewHook := newScriptHook(t, client, renewScript)
+	demotedAt := make(chan time.Time, 1)
+	logs := &logBuffer{}
+	options := testOptions(client)
+	// Renewals fail at 300 and 600 ms; the next tick after the deadline at 700 ms is at 900 ms.
+	options.LeaseDuration = time.Second
+	options.RenewInterval = 300 * time.Millisecond
+	options.RetryInterval = 10 * time.Second
+	options.Logger = logs.logger()
+	options.OnDemoted = func() { demotedAt <- time.Now() }
+	election := startElection(t, options)
+	require.Eventually(t, func() bool { return renewHook.answers.Load() >= 1 }, waitTimeout, pollInterval)
+
+	renewHook.intercept(func(context.Context, func(context.Context) error) error {
+		return errors.New("injected renewal failure")
+	})
+
+	demotion := receive(t, demotedAt)
+	requireSteppedDownInTime(t, options, renewHook.lastAnswerStarted(), demotion)
+	require.False(t, election.IsLeader())
+	require.True(t, logs.contains("leader: renewing the lease failed"))
+	require.True(t, logs.contains("stepping down before the lease may expire"))
+}
+
+func TestElectionStepsDownInTimeWhenRenewalHangs(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	client := newClient(t, miniRedis)
+	renewHook := newScriptHook(t, client, renewScript)
+	demotedAt := make(chan time.Time, 1)
+	unblock := make(chan struct{})
+	closeUnblock := sync.OnceFunc(func() { close(unblock) })
+	options := testOptions(client)
+	options.LeaseDuration = time.Second
+	options.RenewInterval = 300 * time.Millisecond
+	options.RetryInterval = 10 * time.Second
+	options.OnDemoted = func() { demotedAt <- time.Now() }
+	election := startElection(t, options)
+	t.Cleanup(closeUnblock) // runs before the election is stopped, which waits for the hung call
+	require.Eventually(t, func() bool { return renewHook.answers.Load() >= 1 }, waitTimeout, pollInterval)
+
+	// Like go-redis without ContextTimeoutEnabled, the hung call ignores its context.
+	renewHook.intercept(func(context.Context, func(context.Context) error) error {
+		<-unblock
+		return errors.New("hung renewal gave up")
+	})
+
+	demotion := receive(t, demotedAt)
+	requireSteppedDownInTime(t, options, renewHook.lastAnswerStarted(), demotion)
+	require.False(t, election.IsLeader())
+	closeUnblock()
+	require.NoError(t, election.Stop(context.Background()))
+
+	competitorOptions := testOptions(newClient(t, miniRedis))
+	competitorOptions.LeaseDuration = options.LeaseDuration
+	competitorOptions.RetryInterval = 20 * time.Millisecond
+	competitor := startElection(t, competitorOptions)
+	require.Never(t, competitor.IsLeader, 5*competitorOptions.RetryInterval, pollInterval)
+	miniRedis.FastForward(options.LeaseDuration)
+	waitForLeadership(t, competitor)
+}
+
+func TestElectionIgnoresAcquisitionAnsweredAfterTheDeadline(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	client := newClient(t, miniRedis)
+	acquireHook := newScriptHook(t, client, acquireScript)
+	answered := make(chan struct{}, 1)
+	// Redis takes the lock, but its answer arrives after the deadline of the attempt at
+	// testLease minus RenewInterval.
+	acquireHook.intercept(func(ctx context.Context, call func(context.Context) error) error {
+		<-time.After(testLease)
+		err := call(context.WithoutCancel(ctx))
+		select {
+		case answered <- struct{}{}:
+		default:
+		}
+		return err
+	})
+	var elected atomic.Bool
+	options := testOptions(client)
+	options.RetryInterval = 20 * time.Millisecond
+	options.OnElected = func(context.Context, int64) { elected.Store(true) }
+	election := startElection(t, options)
+
+	receive(t, answered)
+
+	require.True(t, miniRedis.Exists(testLockKey))
+	require.False(t, election.IsLeader())
+	require.False(t, elected.Load())
+}
+
 func TestElectionResignsBeforeLeaseExpiresWhenRedisIsUnreachable(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
 	logs := &logBuffer{}
@@ -300,7 +529,34 @@ func TestElectionResignsBeforeLeaseExpiresWhenRedisIsUnreachable(t *testing.T) {
 	earliestExpiry := recorder.lastAnswerStarted().Add(options.LeaseDuration)
 	require.True(t, demotion.Before(earliestExpiry), "demoted %s after the lease may have expired", demotion.Sub(earliestExpiry))
 	require.False(t, election.IsLeader())
-	require.True(t, logs.contains("resigning before it expires"))
+	require.True(t, logs.contains("stepping down before the lease may expire"))
+}
+
+func TestElectionResignsAfterPanicInElectionLoop(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	client := newClient(t, miniRedis)
+	renewHook := newScriptHook(t, client, renewScript)
+	logs := &logBuffer{}
+	demoted := make(chan struct{}, 1)
+	options := testOptions(client)
+	options.RetryInterval = 10 * time.Second
+	options.OnDemoted = func() { demoted <- struct{}{} }
+	// The renewal panics on its own goroutine and comes back as an error, whose log line then
+	// panics on the election goroutine.
+	options.Logger = slog.New(&panickingHandler{Handler: slog.NewTextHandler(logs, nil), trigger: "leader: renewing the lease failed"})
+	election := startElection(t, options)
+	waitForLeadership(t, election)
+
+	renewHook.intercept(func(context.Context, func(context.Context) error) error {
+		panic("injected panic in the renewal")
+	})
+
+	receive(t, demoted)
+	require.False(t, election.IsLeader())
+	require.Eventually(t, func() bool { return !miniRedis.Exists(testLockKey) }, waitTimeout, pollInterval)
+	require.True(t, logs.contains("leader: redis call panicked"))
+	require.True(t, logs.contains("leader: election panicked"))
+	require.NoError(t, election.Stop(context.Background()))
 }
 
 func TestElectionLogsFailedAcquisitionAndRetries(t *testing.T) {
@@ -324,7 +580,7 @@ func TestElectionRecoversPanicsInCallbacks(t *testing.T) {
 	logs := &logBuffer{}
 	options := testOptions(newClient(t, miniRedis))
 	options.Logger = logs.logger()
-	options.OnElected = func(context.Context) { panic("elected failure") }
+	options.OnElected = func(context.Context, int64) { panic("elected failure") }
 	options.OnDemoted = func() { panic("demoted failure") }
 	election := startElection(t, options)
 	waitForLeadership(t, election)
@@ -342,7 +598,7 @@ func TestElectionCancelsOnElectedContextAndWaitsForIt(t *testing.T) {
 	leadershipContexts := make(chan context.Context, 1)
 	var returned atomic.Bool
 	options := testOptions(newClient(t, miniRedis))
-	options.OnElected = func(ctx context.Context) {
+	options.OnElected = func(ctx context.Context, _ int64) {
 		leadershipContexts <- ctx
 		<-ctx.Done()
 		returned.Store(true)
@@ -372,6 +628,24 @@ func TestElectionStopReturnsOpaqueErrorWhenReleaseFails(t *testing.T) {
 	var redisError redis.Error
 	require.False(t, errors.As(err, &redisError), "the error exposes go-redis type %T", redisError)
 	require.False(t, election.IsLeader())
+}
+
+func TestElectionStopLogsLockTakenOverBeforeRelease(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	logs := &logBuffer{}
+	options := testOptions(newClient(t, miniRedis))
+	options.LeaseDuration = 10 * time.Second
+	options.Logger = logs.logger()
+	election := startElection(t, options)
+	waitForLeadership(t, election)
+
+	require.NoError(t, miniRedis.Set(testLockKey, "other:99"))
+
+	require.NoError(t, election.Stop(context.Background()))
+	require.True(t, logs.contains("leader: the lock was taken over before it was released"))
+	lockValueInRedis, err := miniRedis.Get(testLockKey)
+	require.NoError(t, err)
+	require.Equal(t, "other:99", lockValueInRedis)
 }
 
 func TestElectionStopReportsCancelledContext(t *testing.T) {
@@ -421,7 +695,7 @@ func TestElectionParentContextCancellationEndsLeadership(t *testing.T) {
 	leadershipContexts := make(chan context.Context, 1)
 	demoted := make(chan struct{}, 1)
 	options := testOptions(newClient(t, miniRedis))
-	options.OnElected = func(ctx context.Context) { leadershipContexts <- ctx }
+	options.OnElected = func(ctx context.Context, _ int64) { leadershipContexts <- ctx }
 	options.OnDemoted = func() { demoted <- struct{}{} }
 	election := newElection(t, options)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -464,29 +738,31 @@ func TestElectionIsLeaderIsSafeForConcurrentUse(t *testing.T) {
 	readers.Wait()
 }
 
-func TestNewElectionRejectsInvalidOptions(t *testing.T) {
+func TestNewRejectsInvalidOptions(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: "localhost:0"})
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
 	testCases := []struct {
 		name    string
-		options *ElectionOptions
+		options *Options
 	}{
 		{name: "nil options", options: nil},
-		{name: "nil client", options: &ElectionOptions{LockKey: testLockKey, LeaseDuration: time.Second}},
-		{name: "empty lock key", options: &ElectionOptions{Client: client, LeaseDuration: time.Second}},
-		{name: "zero lease", options: &ElectionOptions{Client: client, LockKey: testLockKey}},
-		{name: "negative lease", options: &ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: -time.Second}},
-		{name: "lease below a millisecond", options: &ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: time.Millisecond - 1}},
-		{name: "negative renew interval", options: &ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RenewInterval: -time.Millisecond}},
-		{name: "renew interval half of lease", options: &ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RenewInterval: time.Second / 2}},
-		{name: "renew interval equal to lease", options: &ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RenewInterval: time.Second}},
-		{name: "renew interval longer than lease", options: &ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RenewInterval: 2 * time.Second}},
-		{name: "negative retry interval", options: &ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RetryInterval: -time.Millisecond}},
+		{name: "nil client", options: &Options{LockKey: testLockKey, LeaseDuration: time.Second}},
+		{name: "empty lock key", options: &Options{Client: client, LeaseDuration: time.Second}},
+		{name: "zero lease", options: &Options{Client: client, LockKey: testLockKey}},
+		{name: "negative lease", options: &Options{Client: client, LockKey: testLockKey, LeaseDuration: -time.Second}},
+		{name: "lease below a millisecond", options: &Options{Client: client, LockKey: testLockKey, LeaseDuration: time.Millisecond - 1}},
+		{name: "negative renew interval", options: &Options{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RenewInterval: -time.Millisecond}},
+		{name: "renew interval half of lease", options: &Options{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RenewInterval: time.Second / 2}},
+		{name: "renew interval equal to lease", options: &Options{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RenewInterval: time.Second}},
+		{name: "renew interval longer than lease", options: &Options{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RenewInterval: 2 * time.Second}},
+		{name: "largest renew interval", options: &Options{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RenewInterval: math.MaxInt64}},
+		{name: "renew interval half of truncated lease", options: &Options{Client: client, LockKey: testLockKey, LeaseDuration: 2*time.Millisecond + time.Microsecond, RenewInterval: time.Millisecond}},
+		{name: "negative retry interval", options: &Options{Client: client, LockKey: testLockKey, LeaseDuration: time.Second, RetryInterval: -time.Millisecond}},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			election, err := NewElection(testCase.options)
+			election, err := New(testCase.options)
 
 			require.Error(t, err)
 			require.Nil(t, election)
@@ -494,40 +770,52 @@ func TestNewElectionRejectsInvalidOptions(t *testing.T) {
 	}
 }
 
-func TestNewElectionAppliesDefaults(t *testing.T) {
+func TestNewAppliesDefaults(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: "localhost:0"})
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
 	testCases := []struct {
 		name                  string
-		options               ElectionOptions
+		options               Options
+		expectedLease         time.Duration
 		expectedRenewInterval time.Duration
 		expectedRetryInterval time.Duration
 	}{
 		{
 			name:                  "derived from the lease",
-			options:               ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: 9 * time.Second},
+			options:               Options{Client: client, LockKey: testLockKey, LeaseDuration: 9 * time.Second},
+			expectedLease:         9 * time.Second,
 			expectedRenewInterval: 3 * time.Second,
 			expectedRetryInterval: 4500 * time.Millisecond,
 		},
 		{
 			name:                  "explicit values kept",
-			options:               ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: 9 * time.Second, RenewInterval: time.Second, RetryInterval: 2 * time.Second},
+			options:               Options{Client: client, LockKey: testLockKey, LeaseDuration: 9 * time.Second, RenewInterval: time.Second, RetryInterval: 2 * time.Second},
+			expectedLease:         9 * time.Second,
 			expectedRenewInterval: time.Second,
 			expectedRetryInterval: 2 * time.Second,
 		},
 		{
 			name:                  "shortest lease",
-			options:               ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: time.Millisecond},
+			options:               Options{Client: client, LockKey: testLockKey, LeaseDuration: time.Millisecond},
+			expectedLease:         time.Millisecond,
+			expectedRenewInterval: time.Millisecond / 3,
+			expectedRetryInterval: time.Millisecond / 2,
+		},
+		{
+			name:                  "lease truncated to whole milliseconds",
+			options:               Options{Client: client, LockKey: testLockKey, LeaseDuration: 1500 * time.Microsecond},
+			expectedLease:         time.Millisecond,
 			expectedRenewInterval: time.Millisecond / 3,
 			expectedRetryInterval: time.Millisecond / 2,
 		},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			election, err := NewElection(&testCase.options)
+			election, err := New(&testCase.options)
 
 			require.NoError(t, err)
+			require.Equal(t, testCase.expectedLease, election.options.LeaseDuration)
 			require.Equal(t, testCase.expectedRenewInterval, election.options.RenewInterval)
 			require.Equal(t, testCase.expectedRetryInterval, election.options.RetryInterval)
 			require.NotEmpty(t, election.options.InstanceID)
@@ -535,16 +823,16 @@ func TestNewElectionAppliesDefaults(t *testing.T) {
 	}
 }
 
-func TestNewElectionGeneratesDistinctInstanceIDs(t *testing.T) {
+func TestNewGeneratesDistinctInstanceIDs(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: "localhost:0"})
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	options := &ElectionOptions{Client: client, LockKey: testLockKey, LeaseDuration: time.Second}
+	options := &Options{Client: client, LockKey: testLockKey, LeaseDuration: time.Second}
 
-	first, err := NewElection(options)
+	first, err := New(options)
 	require.NoError(t, err)
-	second, err := NewElection(options)
+	second, err := New(options)
 	require.NoError(t, err)
 
 	require.NotEqual(t, first.options.InstanceID, second.options.InstanceID)
-	require.Empty(t, options.InstanceID, "NewElection must not modify the caller's options")
+	require.Empty(t, options.InstanceID, "New must not modify the caller's options")
 }
