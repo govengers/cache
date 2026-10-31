@@ -1,159 +1,140 @@
-package cache
+package cache_test
 
 import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/govengers/cache"
+	"github.com/stretchr/testify/require"
 )
 
-func TestLocalCacheString(t *testing.T) {
-	cache := NewLocalCache[string, string](&LocalCacheOptions[string]{
-		TTL:      0,
-		Size:     0,
-		CacheKey: &StringCacheKey{},
-	})
-
-	assert.NotNil(t, cache)
-	cache.Set("foo", "bar")
-	value, ok := cache.Get("foo")
-	assert.True(t, ok)
-	assert.Equal(t, "bar", *value)
-	ok = cache.Remove("foo")
-	assert.True(t, ok)
-	value, ok = cache.Get("foo")
-	assert.False(t, ok)
-	assert.Nil(t, value)
+func newLocal[K comparable, V any](t *testing.T, options *cache.LocalOptions[K]) *cache.Local[K, V] {
+	t.Helper()
+	local, err := cache.NewLocal[K, V](options)
+	require.NoError(t, err)
+	return local
 }
 
-func TestLocalCacheInt(t *testing.T) {
-	cache := NewLocalCache[int, int](&LocalCacheOptions[int]{
-		TTL:      0,
-		Size:     0,
-		CacheKey: &IntCacheKey{},
-	})
-
-	assert.NotNil(t, cache)
-	cache.Set(1, 2)
-	value, ok := cache.Get(1)
-	assert.True(t, ok)
-	assert.Equal(t, 2, *value)
-	ok = cache.Remove(1)
-	assert.True(t, ok)
-	value, ok = cache.Get(1)
-	assert.False(t, ok)
-	assert.Nil(t, value)
-}
-
-func TestLocalCacheStruct(t *testing.T) {
-	type TestStruct struct {
-		Foo string
+func TestNewLocalRejectsInvalidOptions(t *testing.T) {
+	testCases := []struct {
+		name    string
+		options *cache.LocalOptions[string]
+	}{
+		{name: "nil options", options: nil},
+		{name: "missing KeyCodec", options: &cache.LocalOptions[string]{}},
+		{name: "negative TTL", options: &cache.LocalOptions[string]{KeyCodec: cache.StringKeyCodec{}, TTL: -time.Second}},
+		{name: "negative Size", options: &cache.LocalOptions[string]{KeyCodec: cache.StringKeyCodec{}, Size: -1}},
 	}
-
-	cache := NewLocalCache[int, TestStruct](&LocalCacheOptions[int]{
-		TTL:      0,
-		Size:     0,
-		CacheKey: &IntCacheKey{},
-	})
-
-	assert.NotNil(t, cache)
-	cache.Set(1, TestStruct{Foo: "bar"})
-	value, ok := cache.Get(1)
-	assert.True(t, ok)
-	assert.Equal(t, "bar", value.Foo)
-	ok = cache.Remove(1)
-	assert.True(t, ok)
-	value, ok = cache.Get(1)
-	assert.False(t, ok)
-	assert.Nil(t, value)
-}
-
-func TestLocalCacheLoad(t *testing.T) {
-	cache := NewLocalCache[string, string](&LocalCacheOptions[string]{
-		TTL:      0,
-		Size:     0,
-		CacheKey: &StringCacheKey{},
-	})
-
-	assert.NotNil(t, cache)
-	value, ok := cache.Get("foo")
-	assert.False(t, ok)
-	assert.Nil(t, value)
-	value, ok = cache.Get("fizz")
-	assert.False(t, ok)
-	assert.Nil(t, value)
-
-	cache.Set("foo", "bar")
-	cache.Set("fizz", "buzz")
-
-	values, err := cache.Load()
-	assert.Nil(t, err)
-	assert.Len(t, values, 2)
-
-	assert.Equal(t, "foo", values[0].Key)
-	assert.Equal(t, "bar", *values[0].Value)
-
-	assert.Equal(t, "fizz", values[1].Key)
-	assert.Equal(t, "buzz", *values[1].Value)
-}
-
-func TestLocalCacheRemovePrefix(t *testing.T) {
-	cache := NewLocalCache[string, string](&LocalCacheOptions[string]{
-		TTL:      0,
-		Size:     0,
-		CacheKey: &StringCacheKey{},
-	})
-	assert.NotNil(t, cache)
-
-	cache.Set("foo:bar", "baz")
-	cache.Set("foo:baz", "qux")
-	cache.Set("fizz:buzz", "fizzbuzz")
-	cache.Set("fizz:qux", "fizzqux")
-	cache.Set("qux:foo", "quxbar")
-	cache.Set("qux:baz", "quxbaz")
-	assert.Len(t, cache.Cache.Keys(), 6)
-	cache.RemovePrefix("foo")
-
-	assert.Len(t, cache.Cache.Keys(), 4)
-	assert.False(t, cache.Contains("foo:bar"))
-	assert.False(t, cache.Contains("foo:baz"))
-
-	cache.RemovePrefix("fizz")
-	assert.Len(t, cache.Cache.Keys(), 2)
-	assert.False(t, cache.Contains("fizz:buzz"))
-	assert.False(t, cache.Contains("fizz:qux"))
-
-	cache.RemovePrefix("qux")
-	assert.Len(t, cache.Cache.Keys(), 0)
-	assert.False(t, cache.Contains("qux:foo"))
-	assert.False(t, cache.Contains("qux:baz"))
-}
-
-func TestLocalCacheOptionsAccessors(t *testing.T) {
-	ck := &StringCacheKey{}
-	opts := &LocalCacheOptions[string]{
-		TTL:      5 * time.Second,
-		Size:     100,
-		CacheKey: ck,
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			local, err := cache.NewLocal[string, string](testCase.options)
+			require.Error(t, err)
+			require.Nil(t, local)
+		})
 	}
-
-	assert.Equal(t, 5*time.Second, opts.GetTtl())
-	assert.Equal(t, 100, opts.GetSize())
-	assert.Equal(t, ck, opts.GetCacheKey())
 }
 
-func TestLocalCacheContains(t *testing.T) {
-	cache := NewLocalCache[string, string](&LocalCacheOptions[string]{
-		TTL:      0,
-		Size:     0,
-		CacheKey: &StringCacheKey{},
-	})
+func TestLocalSetGetRemoveContains(t *testing.T) {
+	type profile struct {
+		Name string
+	}
+	local := newLocal[int, profile](t, &cache.LocalOptions[int]{KeyCodec: cache.IntKeyCodec{}})
 
-	assert.False(t, cache.Contains("missing"))
+	_, found := local.Get(1)
+	require.False(t, found)
+	require.False(t, local.Contains(1))
 
-	cache.Set("present", "value")
-	assert.True(t, cache.Contains("present"))
+	local.Set(1, profile{Name: "first"})
+	value, found := local.Get(1)
+	require.True(t, found)
+	require.Equal(t, profile{Name: "first"}, value)
+	require.True(t, local.Contains(1))
 
-	cache.Remove("present")
-	assert.False(t, cache.Contains("present"))
+	require.True(t, local.Remove(1))
+	require.False(t, local.Remove(1))
+	_, found = local.Get(1)
+	require.False(t, found)
+	require.False(t, local.Contains(1))
+}
+
+func TestLocalRemovePrefix(t *testing.T) {
+	testCases := []struct {
+		name      string
+		prefix    string
+		remaining []string
+	}{
+		{name: "matching prefix", prefix: "user:", remaining: []string{"group:1", "username"}},
+		{name: "prefix without separator", prefix: "user", remaining: []string{"group:1"}},
+		{name: "no match", prefix: "team:", remaining: []string{"user:1", "group:1", "user:2", "username"}},
+		{name: "empty prefix clears the cache", prefix: "", remaining: []string{}},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			local := newLocal[string, int](t, &cache.LocalOptions[string]{KeyCodec: cache.StringKeyCodec{}})
+			for index, key := range []string{"user:1", "group:1", "user:2", "username"} {
+				local.Set(key, index)
+			}
+
+			local.RemovePrefix(testCase.prefix)
+
+			remaining := []string{}
+			for _, entry := range local.Entries() {
+				remaining = append(remaining, entry.Key)
+			}
+			require.Equal(t, testCase.remaining, remaining)
+		})
+	}
+}
+
+func TestLocalRemovePrefixMatchesTheEncodedKey(t *testing.T) {
+	local := newLocal[int, string](t, &cache.LocalOptions[int]{KeyCodec: cache.IntKeyCodec{}})
+	local.Set(1, "one")
+	local.Set(12, "twelve")
+	local.Set(2, "two")
+
+	local.RemovePrefix("1")
+
+	require.Equal(t, []cache.Entry[int, string]{{Key: 2, Value: "two"}}, local.Entries())
+}
+
+func TestLocalEntriesFromLeastToMostRecentlyUsed(t *testing.T) {
+	local := newLocal[string, int](t, &cache.LocalOptions[string]{KeyCodec: cache.StringKeyCodec{}})
+	require.Empty(t, local.Entries())
+
+	local.Set("first", 1)
+	local.Set("second", 2)
+	local.Set("third", 3)
+	local.Get("first")
+
+	require.Equal(t, []cache.Entry[string, int]{
+		{Key: "second", Value: 2},
+		{Key: "third", Value: 3},
+		{Key: "first", Value: 1},
+	}, local.Entries())
+}
+
+func TestLocalSizeDropsTheLeastRecentlyUsedEntry(t *testing.T) {
+	local := newLocal[string, int](t, &cache.LocalOptions[string]{KeyCodec: cache.StringKeyCodec{}, Size: 2})
+	local.Set("first", 1)
+	local.Set("second", 2)
+	local.Get("first")
+
+	local.Set("third", 3)
+
+	require.False(t, local.Contains("second"))
+	require.True(t, local.Contains("first"))
+	require.True(t, local.Contains("third"))
+}
+
+func TestLocalTTLExpiresEntries(t *testing.T) {
+	local := newLocal[string, int](t, &cache.LocalOptions[string]{KeyCodec: cache.StringKeyCodec{}, TTL: 5 * time.Millisecond})
+	local.Set("key", 1)
+
+	require.Eventually(t, func() bool {
+		_, found := local.Get("key")
+		return !found
+	}, time.Second, time.Millisecond)
+	require.False(t, local.Contains("key"))
+	require.Empty(t, local.Entries())
+	require.False(t, local.Remove("key"))
 }
