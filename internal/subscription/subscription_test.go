@@ -127,7 +127,9 @@ func TestKeepDeliversMessagesInOrder(t *testing.T) {
 
 func TestKeepStopsQuietlyWhenContextEnds(t *testing.T) {
 	server := miniredis.RunT(t)
-	keeper := keep(t, server.Addr(), true, heartbeatInterval)
+	hook := &heartbeatHook{}
+	hook.primaryID.Store(new("primary"))
+	keeper := keep(t, server.Addr(), true, heartbeatInterval, hook)
 	receive(t, keeper.subscriptions)
 
 	keeper.stop()
@@ -168,23 +170,32 @@ func TestKeepRetriesUntilFirstSubscription(t *testing.T) {
 	require.Equal(t, "first", receive(t, keeper.messages))
 }
 
-// heartbeatHook sees the heartbeat pipelines (PUBLISH + INFO replication) of the client. It
-// counts the heartbeats, drops them while drop is set and drops the dropOnlyNumber-th one; a
-// dropped PUBLISH looks successful to Keep. While primaryID is set, INFO reports it as the
-// primary's replication ID (miniredis does not support INFO replication).
+// heartbeatHook sees the INFO replication read before each subscription and the heartbeat
+// pipelines (PUBLISH + INFO replication) of the client. It counts the heartbeats, drops them
+// while drop is set and drops the dropOnlyNumber-th one; a dropped PUBLISH looks successful to
+// Keep. While primaryID is set, INFO reports it as the primary's replication ID (miniredis does
+// not support INFO replication); a set firstPrimaryID is reported to the first INFO instead.
 type heartbeatHook struct {
 	drop           atomic.Bool
 	dropOnlyNumber int64
 	published      atomic.Int64
 	primaryID      atomic.Pointer[string]
+	firstPrimaryID string
+	infoCalls      atomic.Int64
 }
 
 func (*heartbeatHook) DialHook(next redis.DialHook) redis.DialHook {
 	return next
 }
 
-func (*heartbeatHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
-	return next
+func (h *heartbeatHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, command redis.Cmder) error {
+		err := next(ctx, command)
+		if h.answerInfo(command) {
+			return nil
+		}
+		return err
+	}
 }
 
 func (h *heartbeatHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
@@ -200,18 +211,33 @@ func (h *heartbeatHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redi
 			forwarded = append(forwarded, command)
 		}
 		err := next(ctx, forwarded)
-		primaryID := h.primaryID.Load()
-		if primaryID == nil {
-			return err
-		}
+		answered := false
 		for _, command := range commands {
-			if info, isInfo := command.(*redis.StringCmd); isInfo && command.Name() == "info" {
-				info.SetErr(nil)
-				info.SetVal("# Replication\r\nrole:master\r\nmaster_replid:" + *primaryID + "\r\n")
-			}
+			answered = h.answerInfo(command) || answered
 		}
-		return nil
+		if answered {
+			return nil
+		}
+		return err
 	}
+}
+
+// answerInfo replaces the reply of an INFO command with the primary ID to report, if any.
+func (h *heartbeatHook) answerInfo(command redis.Cmder) bool {
+	info, isInfo := command.(*redis.StringCmd)
+	if !isInfo || command.Name() != "info" {
+		return false
+	}
+	primaryID := h.primaryID.Load()
+	if h.infoCalls.Add(1) == 1 && h.firstPrimaryID != "" {
+		primaryID = &h.firstPrimaryID
+	}
+	if primaryID == nil {
+		return false
+	}
+	info.SetErr(nil)
+	info.SetVal("# Replication\r\nrole:master\r\nmaster_replid:" + *primaryID + "\r\n")
+	return true
 }
 
 func isHeartbeat(command redis.Cmder) bool {
@@ -329,4 +355,46 @@ func TestKeepGivesUpOnAnUnconfirmedSubscription(t *testing.T) {
 	}, waitDeadline, pollInterval)
 	require.Contains(t, keeper.logged.String(), "timeout")
 	require.Empty(t, keeper.subscriptions)
+}
+
+func TestKeepResubscribesWhenThePrimaryChangesBeforeTheSubscriptionIsUp(t *testing.T) {
+	server := miniredis.RunT(t)
+	// The read before subscribing sees the old primary, the first heartbeat the new one.
+	hook := &heartbeatHook{firstPrimaryID: "old-primary"}
+	hook.primaryID.Store(new("new-primary"))
+	keeper := keep(t, server.Addr(), true, slowHeartbeatInterval, hook)
+	receive(t, keeper.subscriptions)
+
+	receive(t, keeper.subscriptions) // renewed
+
+	require.Contains(t, keeper.logged.String(), "redis: the primary changed, resubscribing")
+	require.Eventually(t, func() bool { return hook.infoCalls.Load() >= 5 }, waitDeadline, pollInterval)
+	require.Empty(t, keeper.subscriptions, "the renewed subscription starts on the new primary")
+	require.Equal(t, 1, strings.Count(keeper.logged.String(), "the primary changed"))
+}
+
+func TestKeepWarnsOnceWhenThePrimaryReportsNoReplicationID(t *testing.T) {
+	server := miniredis.RunT(t) // miniredis does not support INFO replication
+	hook := &heartbeatHook{}
+	keeper := keep(t, server.Addr(), true, slowHeartbeatInterval, hook)
+	receive(t, keeper.subscriptions)
+
+	require.Eventually(t, func() bool { return hook.published.Load() >= 3 }, waitDeadline, pollInterval)
+
+	require.Empty(t, keeper.subscriptions)
+	require.Equal(t, 1, strings.Count(keeper.logged.String(),
+		"redis: the primary reports no replication ID, failovers are detected by missing heartbeats only"))
+}
+
+func TestKeepDoesNotBlameTheReplicationIDWhileTheServerIsDown(t *testing.T) {
+	server := miniredis.RunT(t)
+	address := server.Addr()
+	server.Close()
+	keeper := keep(t, address, true, heartbeatInterval)
+
+	require.Eventually(t, func() bool {
+		return strings.Count(keeper.logged.String(), "redis: subscribing failed") >= 3
+	}, waitDeadline, pollInterval)
+
+	require.NotContains(t, keeper.logged.String(), "reports no replication ID")
 }

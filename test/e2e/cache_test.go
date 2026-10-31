@@ -75,7 +75,7 @@ func newInstance(t *testing.T, client *redis.Client, ttl time.Duration) *instanc
 	t.Cleanup(func() {
 		cleanupContext := context.WithoutCancel(t.Context())
 		require.NoError(t, synchronized.Close(cleanupContext))
-		store.Close()
+		require.NoError(t, store.Close(cleanupContext))
 		require.NoError(t, store.RemovePrefix(cleanupContext, ""))
 	})
 	require.NoError(t, store.AwaitSubscription(t.Context()))

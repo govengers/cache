@@ -61,8 +61,11 @@ func Keep(ctx context.Context, parameters *Parameters) {
 
 // receiveUntilFailure reports whether the subscription was established before it failed.
 func receiveUntilFailure(ctx context.Context, parameters *Parameters) bool {
-	heartbeatChannel := parameters.Channel + ":heartbeat:" + cryptorand.Text()
-	pubSub := parameters.Client.Subscribe(ctx, parameters.Channel, heartbeatChannel)
+	heartbeat := &heartbeat{channel: parameters.Channel + ":heartbeat:" + cryptorand.Text(), interval: parameters.HeartbeatInterval}
+	// The primary's identity is read before subscribing: if it changes before the subscription
+	// is up, the first heartbeat sees a new identity and renews it.
+	heartbeat.readPrimaryID(ctx, parameters)
+	pubSub := parameters.Client.Subscribe(ctx, parameters.Channel, heartbeat.channel)
 	// Closing is what unblocks a pending receive when ctx ends; the second Close only reports
 	// that it is already closed.
 	stopClosing := context.AfterFunc(ctx, func() { _ = pubSub.Close() })
@@ -77,7 +80,7 @@ func receiveUntilFailure(ctx context.Context, parameters *Parameters) bool {
 	if parameters.OnSubscribed != nil {
 		parameters.OnSubscribed()
 	}
-	heartbeat := &heartbeat{channel: heartbeatChannel, interval: parameters.HeartbeatInterval, lastReceivedAt: time.Now()}
+	heartbeat.lastReceivedAt = time.Now()
 	for {
 		if heartbeat.missed(time.Now()) {
 			parameters.Logger.Warn("redis: subscription missed its heartbeats, resubscribing", "channel", parameters.Channel)

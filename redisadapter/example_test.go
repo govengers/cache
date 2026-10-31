@@ -30,7 +30,12 @@ func ExampleNew() {
 	if err != nil {
 		panic(err)
 	}
-	defer store.Close()
+	ctx := context.Background()
+	defer func() {
+		if err := store.Close(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	changes := make(chan cache.Event[string, string], 1)
 	unregister := store.OnEvent(func(event cache.Event[string, string]) {
@@ -39,7 +44,6 @@ func ExampleNew() {
 		}
 	})
 	defer unregister()
-	ctx := context.Background()
 	if err := store.AwaitSubscription(ctx); err != nil {
 		panic(err)
 	}

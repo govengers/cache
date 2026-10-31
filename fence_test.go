@@ -16,7 +16,7 @@ func TestReadFenceKeepsAReadUnlessItsKeyOrAPrefixChanged(t *testing.T) {
 		{name: "another key", change: func(fence *readFence[string, string]) { fence.changeKey("user:2", func() {}) }, kept: true},
 		{name: "the key", change: func(fence *readFence[string, string]) { fence.changeKey("user:1", func() {}) }},
 		{name: "a prefix covering the key", change: func(fence *readFence[string, string]) { fence.changePrefix("user:", func() {}) }},
-		{name: "a prefix not covering the key", change: func(fence *readFence[string, string]) { fence.changePrefix("group:", func() {}) }},
+		{name: "a prefix not covering the key", change: func(fence *readFence[string, string]) { fence.changePrefix("group:", func() {}) }, kept: true},
 		{name: "a reset", change: func(fence *readFence[string, string]) { fence.changePrefix("", func() {}) }},
 	}
 	for _, testCase := range testCases {
@@ -122,4 +122,83 @@ func TestReadFenceFailedLoadStopsTracking(t *testing.T) {
 	fence.finishLoad(tracker, nil, nil)
 
 	require.Empty(t, fence.loadsInFlight)
+}
+
+func TestReadFencePrefixChangeDropsOnlyTheReadsItCovers(t *testing.T) {
+	testCases := []struct {
+		prefix string
+		kept   []string
+	}{
+		{prefix: "user:", kept: []string{"group:1"}},
+		{prefix: "user:1", kept: []string{"user:2", "group:1"}},
+		{prefix: "team:", kept: []string{"user:1", "user:2", "group:1"}},
+		{prefix: "", kept: nil},
+	}
+	for _, testCase := range testCases {
+		t.Run("prefix "+testCase.prefix, func(t *testing.T) {
+			fence := newReadFence[string, string](StringKeyCodec{})
+			keys := []string{"user:1", "user:2", "group:1"}
+			tickets := make([]readTicket, len(keys))
+			for index, key := range keys {
+				tickets[index] = fence.beginRead(key)
+			}
+
+			fence.changePrefix(testCase.prefix, func() {})
+
+			var kept []string
+			for index, key := range keys {
+				fence.finishRead(key, tickets[index], func() { kept = append(kept, key) })
+			}
+			require.Equal(t, testCase.kept, kept)
+		})
+	}
+}
+
+func TestReadFenceFinishWrite(t *testing.T) {
+	t.Run("keeps an unchanged write", func(t *testing.T) {
+		fence := newReadFence[string, string](StringKeyCodec{})
+		write := fence.beginRead("key")
+
+		kept := false
+		fence.finishWrite("key", write, func() { kept = true })
+
+		require.True(t, kept)
+		require.Empty(t, fence.readsInFlight)
+	})
+	t.Run("drops a write overtaken by a change", func(t *testing.T) {
+		fence := newReadFence[string, string](StringKeyCodec{})
+		write := fence.beginRead("key")
+		fence.changeKey("key", func() {})
+
+		kept := false
+		fence.finishWrite("key", write, func() { kept = true })
+
+		require.False(t, kept)
+	})
+	t.Run("counts as a change for reads that began before it", func(t *testing.T) {
+		fence := newReadFence[string, string](StringKeyCodec{})
+		read := fence.beginRead("key")
+		write := fence.beginRead("key")
+		fence.finishWrite("key", write, func() {})
+		later := fence.beginRead("key")
+
+		var kept []string
+		fence.finishRead("key", read, func() { kept = append(kept, "earlier read") })
+		fence.finishRead("key", later, func() { kept = append(kept, "later read") })
+
+		require.Equal(t, []string{"later read"}, kept)
+		require.Empty(t, fence.readsInFlight)
+	})
+	t.Run("counts as a change for loads in flight", func(t *testing.T) {
+		fence := newReadFence[string, string](StringKeyCodec{})
+		tracker := fence.beginLoad()
+		write := fence.beginRead("written")
+		fence.finishWrite("written", write, func() {})
+
+		var kept []string
+		entries := []Entry[string, string]{{Key: "written", Value: "old"}, {Key: "other", Value: "value"}}
+		fence.finishLoad(tracker, entries, func(key, _ string) { kept = append(kept, key) })
+
+		require.Equal(t, []string{"other"}, kept)
+	})
 }

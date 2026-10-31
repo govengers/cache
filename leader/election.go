@@ -18,6 +18,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// maximumRetryInterval keeps RetryInterval plus its jitter far from overflowing.
+const maximumRetryInterval = 24 * time.Hour
+
 // ErrAlreadyStarted is returned by Start on an election that was started before.
 var ErrAlreadyStarted = errors.New("leader: election already started")
 
@@ -43,7 +46,7 @@ type Options struct {
 	// shorter than half of LeaseDuration. Zero: a third of LeaseDuration.
 	RenewInterval time.Duration
 	// RetryInterval is how often a follower tries to take the lock, plus up to a quarter of it as
-	// jitter. Zero: half of LeaseDuration.
+	// jitter. At most a day. Zero: half of LeaseDuration.
 	RetryInterval time.Duration
 	// OnElected runs in its own goroutine when this process becomes leader, with the fencing
 	// token of that leadership. Its context is cancelled when the leadership ends; it must
@@ -69,6 +72,9 @@ type Election struct {
 	logger  *slog.Logger
 	wake    chan struct{}
 	running sync.WaitGroup
+	// callSlot admits one Redis call of the election at a time: a call abandoned at its
+	// deadline holds it until go-redis gives up on the call, so abandoned calls cannot pile up.
+	callSlot chan struct{}
 
 	mutex   sync.Mutex
 	started bool
@@ -94,9 +100,10 @@ func New(options *Options) (*Election, error) {
 		return nil, err
 	}
 	return &Election{
-		options: resolved,
-		logger:  cmp.Or(resolved.Logger, slog.New(slog.DiscardHandler)),
-		wake:    make(chan struct{}, 1),
+		options:  resolved,
+		logger:   cmp.Or(resolved.Logger, slog.New(slog.DiscardHandler)),
+		wake:     make(chan struct{}, 1),
+		callSlot: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -115,8 +122,8 @@ func resolve(options *Options) (Options, error) {
 	if resolved.RenewInterval <= 0 || resolved.RenewInterval >= resolved.LeaseDuration-resolved.RenewInterval {
 		return Options{}, fmt.Errorf("leader: RenewInterval %s must be positive and shorter than half of LeaseDuration %s", resolved.RenewInterval, resolved.LeaseDuration)
 	}
-	if resolved.RetryInterval <= 0 {
-		return Options{}, fmt.Errorf("leader: RetryInterval %s must be positive", resolved.RetryInterval)
+	if resolved.RetryInterval <= 0 || resolved.RetryInterval > maximumRetryInterval {
+		return Options{}, fmt.Errorf("leader: RetryInterval %s must be positive and at most %s", resolved.RetryInterval, maximumRetryInterval)
 	}
 	return resolved, nil
 }
@@ -178,7 +185,7 @@ func (e *Election) Start(ctx context.Context) error {
 	e.running.Go(func() {
 		recovery.Run(e.logger, "leader: election", func() { e.run(electionContext) })
 		// Also after a panic in run, so a leadership never outlives its election.
-		e.resignUnlessStopping(electionContext)
+		recovery.Run(e.logger, "leader: ending the election", func() { e.resignUnlessStopping(electionContext) })
 	})
 	return nil
 }
@@ -198,9 +205,13 @@ func (e *Election) Stop(ctx context.Context) error {
 	e.mutex.Unlock()
 
 	e.stop()
-	e.running.Wait()
-
+	// Step down before waiting: an abandoned Redis call can take until the client's timeouts,
+	// and the process must not claim the leadership meanwhile.
 	ended := e.demote()
+	e.running.Wait()
+	if promotedMeanwhile := e.demote(); promotedMeanwhile != nil {
+		ended = promotedMeanwhile
+	}
 	if ended == nil {
 		return nil
 	}
@@ -263,6 +274,9 @@ func (e *Election) holdLeadership(ctx context.Context, current *leadership) {
 		case <-deadline.C:
 			e.logger.Warn("leader: no renewal succeeded in time, stepping down before the lease may expire", "lock", e.options.LockKey)
 			e.demote()
+			// The lock may still hold this term's value; releasing it lets a follower take over
+			// at once instead of after the lease.
+			e.resignInBackground(current.lockValue)
 			return
 		case <-ticker.C:
 		}
@@ -360,6 +374,19 @@ func (e *Election) resignUnlessStopping(ctx context.Context) {
 	if err := e.resign(resignContext, ended.lockValue); err != nil {
 		e.logger.Warn("leader: resigning failed, the lock expires with its lease", "lock", e.options.LockKey, "error", err)
 	}
+}
+
+// resignInBackground releases lockValue if the lock still holds it, without waiting for Redis.
+func (e *Election) resignInBackground(lockValue string) {
+	e.running.Go(func() {
+		recovery.Run(e.logger, "leader: resigning", func() {
+			resignContext, cancel := context.WithTimeout(context.Background(), e.options.LeaseDuration)
+			defer cancel()
+			if err := e.resign(resignContext, lockValue); err != nil {
+				e.logger.Warn("leader: resigning failed, the lock expires with its lease", "lock", e.options.LockKey, "error", err)
+			}
+		})
+	})
 }
 
 func (e *Election) wakeFollower(string) {

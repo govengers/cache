@@ -106,4 +106,11 @@ func TestCachesAndElectionSurviveASentinelFailover(t *testing.T) {
 		token := election.FencingToken()
 		return err == nil && election.IsLeader() && token >= tokenBeforeFailover && lockValue == "only:"+strconv.FormatInt(token, 10)
 	}, failoverDeadline, 100*time.Millisecond)
+	// The remaining lease only grows when the election renews it on the new primary.
+	remaining, err := writer.client.PTTL(t.Context(), lockKey).Result()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		renewed, err := writer.client.PTTL(t.Context(), lockKey).Result()
+		return err == nil && renewed > remaining
+	}, failoverDeadline, 100*time.Millisecond)
 }

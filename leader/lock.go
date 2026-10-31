@@ -50,16 +50,22 @@ return 0
 `)
 )
 
-var errDeadlinePassed = errors.New("leader: no reply before the lease deadline")
+var (
+	errDeadlinePassed = errors.New("leader: no reply before the lease deadline")
+	errCallInFlight   = errors.New("leader: an abandoned Redis call is still in flight")
+)
 
 // tryAcquire takes the lock if it is free and returns the new leadership, or nil. A reply that
 // arrives so late that the lease may expire before the first renewal does not count.
 func (e *Election) tryAcquire(ctx context.Context) *leadership {
 	keys := []string{e.options.LockKey, e.options.LockKey + ":epoch"}
 	attemptedAt := time.Now()
-	epoch, err := callBefore(ctx, e, e.leadUntil(attemptedAt), func(ctx context.Context) (string, error) {
+	acquire := func(ctx context.Context) (string, error) {
 		return acquireScript.Run(ctx, e.options.Client, keys, e.options.InstanceID, e.options.LeaseDuration.Milliseconds()).Text()
-	})
+	}
+	// A lock taken by a reply that came too late must not block every process until it expires.
+	releaseLateLock := func(epoch string) { e.resignInBackground(e.options.InstanceID + ":" + epoch) }
+	epoch, err := callBefore(ctx, e, e.leadUntil(attemptedAt), acquire, releaseLateLock)
 	if errors.Is(err, redis.Nil) || ctx.Err() != nil {
 		return nil
 	}
@@ -80,7 +86,7 @@ func (e *Election) tryAcquire(ctx context.Context) *leadership {
 func (e *Election) renew(ctx context.Context, lockValue string, deadline time.Time) (bool, error) {
 	renewed, err := callBefore(ctx, e, deadline, func(ctx context.Context) (int64, error) {
 		return renewScript.Run(ctx, e.options.Client, []string{e.options.LockKey}, lockValue, e.options.LeaseDuration.Milliseconds()).Int64()
-	})
+	}, nil)
 	if err != nil {
 		return false, err
 	}
@@ -113,12 +119,20 @@ type callResult[T any] struct {
 
 // callBefore runs call and stops waiting for it at deadline. go-redis bounds socket I/O by its
 // own timeouts, not by the context, unless the client sets ContextTimeoutEnabled; a lease must
-// not depend on that. An abandoned call keeps running until those timeouts end; Stop waits for
-// it.
-func callBefore[T any](ctx context.Context, election *Election, deadline time.Time, call func(ctx context.Context) (T, error)) (T, error) {
+// not depend on that. A result that arrives too late counts as no result: discard, if any, gets
+// a late successful value to undo its effect. An abandoned call keeps running until those
+// timeouts end, holding the call slot; Stop waits for it.
+func callBefore[T any](ctx context.Context, election *Election, deadline time.Time, call func(ctx context.Context) (T, error), discard func(T)) (T, error) {
+	var zero T
+	select {
+	case election.callSlot <- struct{}{}:
+	default:
+		return zero, errCallInFlight
+	}
 	callContext, cancel := context.WithDeadline(ctx, deadline)
 	results := make(chan callResult[T], 1)
 	election.running.Go(func() {
+		defer func() { <-election.callSlot }()
 		defer cancel()
 		result := callResult[T]{err: errors.New("leader: redis call panicked")}
 		recovery.Run(election.logger, "leader: redis call", func() {
@@ -129,14 +143,35 @@ func callBefore[T any](ctx context.Context, election *Election, deadline time.Ti
 	})
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
-	var zero T
 	select {
 	case result := <-results:
-		return result.value, result.err
+		if time.Now().Before(deadline) && ctx.Err() == nil {
+			return result.value, result.err
+		}
+		discardSuccess(result, discard)
+		return zero, errDeadlinePassed
 	case <-timer.C:
+		discardWhenDone(election, results, discard)
 		return zero, errDeadlinePassed
 	case <-ctx.Done():
+		discardWhenDone(election, results, discard)
 		return zero, fmt.Errorf("leader: redis call: %w", ctx.Err())
+	}
+}
+
+// discardWhenDone waits in the background for an abandoned call and discards its result.
+func discardWhenDone[T any](election *Election, results <-chan callResult[T], discard func(T)) {
+	if discard == nil {
+		return
+	}
+	election.running.Go(func() {
+		recovery.Run(election.logger, "leader: discarding a late reply", func() { discardSuccess(<-results, discard) })
+	})
+}
+
+func discardSuccess[T any](result callResult[T], discard func(T)) {
+	if result.err == nil && discard != nil {
+		discard(result.value)
 	}
 }
 

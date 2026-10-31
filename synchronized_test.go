@@ -3,6 +3,7 @@ package cache_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -306,7 +307,7 @@ var changesDuringRead = []struct {
 	{name: "a set of the key", events: []cache.Event[string, string]{{Type: cache.EventSet, Key: "user:1", Value: "fresh"}}},
 	{name: "a removal of the key", events: []cache.Event[string, string]{{Type: cache.EventRemove, Key: "user:1"}}},
 	{name: "a prefix removal covering the key", events: []cache.Event[string, string]{{Type: cache.EventRemovePrefix, Prefix: "user:"}}},
-	{name: "a prefix removal not covering the key", events: []cache.Event[string, string]{{Type: cache.EventRemovePrefix, Prefix: "group:"}}},
+	{name: "a prefix removal not covering the key", events: []cache.Event[string, string]{{Type: cache.EventRemovePrefix, Prefix: "group:"}}, kept: true},
 	{name: "a reset", events: []cache.Event[string, string]{{Type: cache.EventReset}}},
 }
 
@@ -430,4 +431,79 @@ func TestSynchronizedPreloadSkipsEntriesChangedMeanwhile(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSynchronizedEveryMethodReturnsErrClosedAfterClose(t *testing.T) {
+	operations := map[string]func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error{
+		"Get": func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
+			_, err := synchronized.Get(ctx, "key")
+			return err
+		},
+		"TTL": func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
+			_, err := synchronized.TTL(ctx, "key")
+			return err
+		},
+		"Set": func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
+			return synchronized.Set(ctx, "key", "value")
+		},
+		"Remove": func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
+			return synchronized.Remove(ctx, "key")
+		},
+		"RemovePrefix": func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
+			return synchronized.RemovePrefix(ctx, "key")
+		},
+		"Contains": func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
+			_, err := synchronized.Contains(ctx, "key")
+			return err
+		},
+		"Preload": func(ctx context.Context, synchronized *cache.Synchronized[string, string]) error {
+			return synchronized.Preload(ctx)
+		},
+	}
+	for _, asyncWrites := range []bool{false, true} {
+		for name, operation := range operations {
+			t.Run(fmt.Sprintf("%s async %t", name, asyncWrites), func(t *testing.T) {
+				backend := newFakeBackend()
+				synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend, AsyncWrites: asyncWrites})
+				backend.emit(cache.Event[string, string]{Type: cache.EventSet, Key: "key", Value: "local"}) // a local hit is refused too
+				require.NoError(t, synchronized.Close(t.Context()))
+
+				require.ErrorIs(t, operation(t.Context(), synchronized), cache.ErrClosed)
+			})
+		}
+	}
+}
+
+func TestSynchronizedGetInFlightAcrossASetKeepsTheSetValue(t *testing.T) {
+	var synchronized *cache.Synchronized[string, string]
+	backend := newFakeBackend()
+	backend.set = func(context.Context, string, string) error { return nil }
+	backend.get = func(ctx context.Context, key string) (string, error) {
+		backend.get = nil
+		require.NoError(t, synchronized.Set(ctx, key, "written"))
+		return "read before the write", nil
+	}
+	synchronized = newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
+
+	value, err := synchronized.Get(t.Context(), "key")
+	require.NoError(t, err)
+	require.Equal(t, "read before the write", value)
+
+	requireLocal(t, synchronized, "key", "written")
+}
+
+func TestSynchronizedPreloadInFlightAcrossASetSkipsThatKey(t *testing.T) {
+	var synchronized *cache.Synchronized[string, string]
+	backend := newFakeBackend()
+	backend.set = func(context.Context, string, string) error { return nil }
+	backend.load = func(ctx context.Context) ([]cache.Entry[string, string], error) {
+		require.NoError(t, synchronized.Set(ctx, "written", "new"))
+		return []cache.Entry[string, string]{{Key: "written", Value: "old"}, {Key: "other", Value: "value"}}, nil
+	}
+	synchronized = newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
+
+	require.NoError(t, synchronized.Preload(t.Context()))
+
+	requireLocal(t, synchronized, "written", "new")
+	requireLocal(t, synchronized, "other", "value")
 }

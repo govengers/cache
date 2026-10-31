@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -42,7 +43,7 @@ type Options[K comparable] struct {
 	// is published on the primary, and that the primary is still the same server. A
 	// subscription left on a former primary after a Sentinel failover is renewed at the next
 	// heartbeat, one on a dead connection after three to four intervals. Each heartbeat is one
-	// PUBLISH and one INFO on the primary. Zero: 5s.
+	// PUBLISH and one INFO on the primary. At most an hour. Zero: 5s.
 	HeartbeatInterval time.Duration
 	// ScanCount is the COUNT hint of the SCAN calls of Load and RemovePrefix. Zero: the Redis
 	// default.
@@ -52,7 +53,12 @@ type Options[K comparable] struct {
 	Logger *slog.Logger
 }
 
-const defaultHeartbeatInterval = 5 * time.Second
+const (
+	defaultHeartbeatInterval = 5 * time.Second
+	maximumHeartbeatInterval = time.Hour
+	// maximumKeysPerScript stays well below the number of values Lua's unpack can return.
+	maximumKeysPerScript = 1000
+)
 
 // Store is a cache.Backend in Redis. Values are encoded with MessagePack. It is safe for
 // concurrent use.
@@ -107,6 +113,9 @@ func validate[K comparable](options *Options[K]) error {
 	}
 	if options.TTL < 0 || options.ScanCount < 0 || options.HeartbeatInterval < 0 {
 		return fmt.Errorf("redisadapter: Options.TTL %s, ScanCount %d and HeartbeatInterval %s must not be negative", options.TTL, options.ScanCount, options.HeartbeatInterval)
+	}
+	if options.HeartbeatInterval > maximumHeartbeatInterval {
+		return fmt.Errorf("redisadapter: Options.HeartbeatInterval %s is longer than %s", options.HeartbeatInterval, maximumHeartbeatInterval)
 	}
 	return nil
 }
@@ -172,6 +181,15 @@ end
 return 1
 `)
 
+	// KEYS: keys. ARGV: channel, event.
+	unlinkScript = redis.NewScript(`
+redis.call('UNLINK', unpack(KEYS))
+if ARGV[1] ~= '' then
+	redis.call('PUBLISH', ARGV[1], ARGV[2])
+end
+return 1
+`)
+
 	// KEYS: key. ARGV: channel, event.
 	removeScript = redis.NewScript(`
 redis.call('DEL', KEYS[1])
@@ -202,7 +220,11 @@ func (s *Store[K, V]) Set(ctx context.Context, key K, value V) error {
 // ttlMilliseconds rounds the TTL up to whole milliseconds, Redis's precision, so an entry never
 // expires before its TTL; zero stays zero, no expiry.
 func (s *Store[K, V]) ttlMilliseconds() int64 {
-	return int64((s.ttl + time.Millisecond - 1) / time.Millisecond)
+	milliseconds := s.ttl.Milliseconds()
+	if s.ttl%time.Millisecond != 0 {
+		milliseconds++
+	}
+	return milliseconds
 }
 
 // Remove deletes key and publishes the change.
@@ -221,22 +243,34 @@ func (s *Store[K, V]) Remove(ctx context.Context, key K) error {
 // empty prefix clears the namespace. Keys written while it runs may survive. The change is
 // published even when the removal fails part way, because some keys may be gone already.
 func (s *Store[K, V]) RemovePrefix(ctx context.Context, prefix string) error {
+	event, err := encodeEvent(&eventMessage{Type: cache.EventRemovePrefix, Prefix: prefix})
+	if err != nil {
+		return opaque.Error("redisadapter: remove prefix "+s.namespace+prefix, err)
+	}
 	removeError := s.scan(ctx, prefix, func(redisKeys []string) error {
-		return s.client.Unlink(ctx, redisKeys...).Err()
+		return s.unlinkAndPublish(ctx, redisKeys, event)
 	})
 	if removeError != nil {
 		removeError = opaque.Error("redisadapter: remove prefix "+s.namespace+prefix, removeError)
 	}
-	return errors.Join(removeError, s.publish(ctx, &eventMessage{Type: cache.EventRemovePrefix, Prefix: prefix}))
+	// Also when nothing matched or a page failed: peers may hold copies of keys that are gone.
+	return errors.Join(removeError, s.publish(ctx, event))
 }
 
-func (s *Store[K, V]) publish(ctx context.Context, message *eventMessage) error {
+// unlinkAndPublish removes redisKeys in scripts of at most maximumKeysPerScript keys, each of
+// which publishes event, so no removed key goes unannounced even if a later page fails.
+func (s *Store[K, V]) unlinkAndPublish(ctx context.Context, redisKeys []string, event []byte) error {
+	for chunk := range slices.Chunk(redisKeys, maximumKeysPerScript) {
+		if err := unlinkScript.Run(ctx, s.client, chunk, s.eventChannel, event).Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store[K, V]) publish(ctx context.Context, event []byte) error {
 	if s.eventChannel == "" {
 		return nil
-	}
-	event, err := encodeEvent(message)
-	if err != nil {
-		return opaque.Error("redisadapter: publish on "+s.eventChannel, err)
 	}
 	if err := s.client.Publish(ctx, s.eventChannel, event).Err(); err != nil {
 		return opaque.Error("redisadapter: publish on "+s.eventChannel, err)
@@ -273,11 +307,23 @@ func (s *Store[K, V]) AwaitSubscription(ctx context.Context) error {
 	}
 }
 
-// Close stops receiving events and waits for the receiving goroutine to exit. It does not close
+// Close stops receiving events and waits for the receiving goroutine to exit, or returns ctx's
+// error. The goroutine may be inside a Redis call, which a go-redis client ends at ctx's
+// deadline only with ContextTimeoutEnabled, otherwise at its ReadTimeout. Close does not close
 // the Redis client. It is safe to call more than once.
-func (s *Store[K, V]) Close() {
+func (s *Store[K, V]) Close(ctx context.Context) error {
 	s.stopReceiving()
-	s.receiving.Wait()
+	stopped := make(chan struct{})
+	go func() { // only waits, nothing in it can panic
+		s.receiving.Wait()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("redisadapter: close: %w", ctx.Err())
+	}
 }
 
 // KeyCodec returns the codec of Options.KeyCodec.

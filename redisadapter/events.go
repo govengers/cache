@@ -3,6 +3,8 @@ package redisadapter
 import (
 	"context"
 	"fmt"
+	"slices"
+	"time"
 
 	"github.com/govengers/cache"
 	"github.com/govengers/cache/internal/recovery"
@@ -52,28 +54,29 @@ func (s *Store[K, V]) OnEvent(handler func(cache.Event[K, V])) (unregister func(
 func (s *Store[K, V]) unregister(id uint64) {
 	s.handlersMutex.Lock()
 	defer s.handlersMutex.Unlock()
-	for index, registered := range s.handlers {
-		if registered.id == id {
-			s.handlers = append(s.handlers[:index:index], s.handlers[index+1:]...)
-			return
-		}
-	}
+	s.handlers = slices.DeleteFunc(s.handlers, func(registered registeredHandler[K, V]) bool {
+		return registered.id == id
+	})
 }
 
 func (s *Store[K, V]) startReceiving() {
 	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // G118: Close calls cancel through stopReceiving
 	s.stopReceiving = cancel
+	parameters := &subscription.Parameters{
+		Client:            s.client,
+		Channel:           s.eventChannel,
+		Logger:            s.logger,
+		HeartbeatInterval: s.heartbeatInterval,
+		OnSubscribed:      s.markSubscribed,
+		OnMessage:         s.decodeAndDeliver,
+	}
 	s.receiving.Go(func() {
-		recovery.Run(s.logger, "redisadapter: receiving events", func() {
-			subscription.Keep(ctx, &subscription.Parameters{
-				Client:            s.client,
-				Channel:           s.eventChannel,
-				Logger:            s.logger,
-				HeartbeatInterval: s.heartbeatInterval,
-				OnSubscribed:      s.markSubscribed,
-				OnMessage:         s.decodeAndDeliver,
-			})
-		})
+		// Keep returns only when ctx ends; after a panic it starts over, and the new
+		// subscription resets the handlers' copies.
+		for ctx.Err() == nil {
+			recovery.Run(s.logger, "redisadapter: receiving events", func() { subscription.Keep(ctx, parameters) })
+			sleep(ctx, restartDelay)
+		}
 	})
 }
 
@@ -94,6 +97,19 @@ func (s *Store[K, V]) decodeAndDeliver(payload string) {
 		event = cache.Event[K, V]{Type: cache.EventReset}
 	}
 	s.deliver(event)
+}
+
+// restartDelay keeps a reception that panics at once from spinning.
+const restartDelay = time.Second
+
+// sleep waits for duration or until ctx ends.
+func sleep(ctx context.Context, duration time.Duration) {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
 }
 
 func (s *Store[K, V]) decodeEvent(payload string) (cache.Event[K, V], error) {

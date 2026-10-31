@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,9 @@ type heartbeat struct {
 	published       uint64
 	received        uint64
 	primaryID       string
+	// identityUnknown records that the primary did not report a replication ID, so it is
+	// logged once per subscription instead of with every heartbeat.
+	identityUnknown bool
 }
 
 func (h *heartbeat) missed(now time.Time) bool {
@@ -49,9 +53,33 @@ func (h *heartbeat) publishIfDue(ctx context.Context, parameters *Parameters) bo
 	} else {
 		h.published++
 	}
-	// A server that does not report a replication ID (an error, or a fake in tests) leaves the
-	// gap and timeout checks, which still catch a lost subscription.
-	return replication.Err() == nil && h.primaryChanged(replicationID(replication.Val()))
+	return h.primaryChanged(h.identify(ctx, parameters, replication))
+}
+
+// readPrimaryID records the primary's replication ID as the one the subscription starts on.
+func (h *heartbeat) readPrimaryID(ctx context.Context, parameters *Parameters) {
+	readContext, cancel := context.WithTimeout(ctx, h.interval)
+	defer cancel()
+	h.primaryID = h.identify(ctx, parameters, parameters.Client.Info(readContext, "replication"))
+}
+
+// identify returns the replication ID from the reply of INFO replication, or "". When the server
+// answers without one (an ACL without INFO, a proxy, a fake in tests), only the gap and timeout
+// checks catch a subscription left on a former primary; that is logged once.
+func (h *heartbeat) identify(ctx context.Context, parameters *Parameters, replication *redis.StringCmd) string {
+	primaryID := ""
+	if replication.Err() == nil {
+		primaryID = replicationID(replication.Val())
+	}
+	// A failed connection says nothing about whether the server reports an ID.
+	var refused redis.Error
+	answered := replication.Err() == nil || errors.As(replication.Err(), &refused)
+	if primaryID == "" && answered && !h.identityUnknown && ctx.Err() == nil {
+		h.identityUnknown = true
+		parameters.Logger.Warn("redis: the primary reports no replication ID, failovers are detected by missing heartbeats only",
+			"channel", parameters.Channel, "error", replication.Err())
+	}
+	return primaryID
 }
 
 func (h *heartbeat) primaryChanged(primaryID string) bool {

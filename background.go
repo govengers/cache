@@ -50,6 +50,10 @@ func (w *backgroundWriter) enqueue(ctx context.Context, operation string, write 
 		w.stateMutex.Unlock()
 		return ErrClosed
 	}
+	if err := ctx.Err(); err != nil {
+		w.stateMutex.Unlock()
+		return fmt.Errorf("cache: queue background %s: %w", operation, err)
+	}
 	w.senders.Add(1)
 	w.stateMutex.Unlock()
 	defer w.senders.Done()

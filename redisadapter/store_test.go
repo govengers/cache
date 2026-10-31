@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,8 +52,16 @@ func newStore[K comparable, V any](t *testing.T, options *redisadapter.Options[K
 	t.Helper()
 	store, err := redisadapter.New[K, V](options)
 	require.NoError(t, err)
-	t.Cleanup(store.Close)
+	t.Cleanup(func() { require.NoError(t, store.Close(closeContext(t))) })
 	return store
+}
+
+// closeContext bounds a Close in a cleanup, where the test's context has ended already.
+func closeContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), waitDeadline)
+	t.Cleanup(cancel)
+	return ctx
 }
 
 func encode(t *testing.T, value any) string {
@@ -84,18 +94,21 @@ func newLogger() (*slog.Logger, *lockedBuffer) {
 	return slog.New(slog.NewTextHandler(logged, nil)), logged
 }
 
-// failingHook fails every command named command without sending it to Redis.
+// failingHook fails every command named command after the first passing ones, without sending
+// it to Redis.
 type failingHook struct {
 	command string
+	passing int64
+	seen    atomic.Int64
 }
 
-func (failingHook) DialHook(next redis.DialHook) redis.DialHook {
+func (*failingHook) DialHook(next redis.DialHook) redis.DialHook {
 	return next
 }
 
-func (h failingHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+func (h *failingHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, command redis.Cmder) error {
-		if command.Name() == h.command {
+		if command.Name() == h.command && h.seen.Add(1) > h.passing {
 			command.SetErr(errInjected)
 			return errInjected
 		}
@@ -103,7 +116,7 @@ func (h failingHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	}
 }
 
-func (failingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+func (*failingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return next
 }
 
@@ -126,6 +139,7 @@ func TestNewRejectsInvalidOptions(t *testing.T) {
 		{name: "missing key prefix", options: valid(func(options *redisadapter.Options[string]) { options.KeyPrefix = "" })},
 		{name: "negative TTL", options: valid(func(options *redisadapter.Options[string]) { options.TTL = -time.Second })},
 		{name: "negative scan count", options: valid(func(options *redisadapter.Options[string]) { options.ScanCount = -1 })},
+		{name: "heartbeat interval above an hour", options: valid(func(options *redisadapter.Options[string]) { options.HeartbeatInterval = time.Hour + time.Nanosecond })},
 		{name: "negative heartbeat interval", options: valid(func(options *redisadapter.Options[string]) { options.HeartbeatInterval = -time.Second })},
 	}
 	for _, testCase := range testCases {
@@ -216,6 +230,71 @@ func TestStoreTTL(t *testing.T) {
 	}
 }
 
+// scriptRecorder records the arguments of every script call; it is for one goroutine at a time.
+type scriptRecorder struct {
+	calls [][]any
+}
+
+func (*scriptRecorder) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (r *scriptRecorder) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, command redis.Cmder) error {
+		if command.Name() == "evalsha" {
+			r.calls = append(r.calls, command.Args())
+		}
+		return next(ctx, command)
+	}
+}
+
+func (*scriptRecorder) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func TestStoreSendsTTLRoundedUpToMilliseconds(t *testing.T) {
+	testCases := []struct {
+		name     string
+		ttl      time.Duration
+		expected int64
+	}{
+		{name: "no TTL", ttl: 0, expected: 0},
+		{name: "below a millisecond", ttl: time.Nanosecond, expected: 1},
+		{name: "whole milliseconds", ttl: 10 * time.Second, expected: 10000},
+		{name: "fraction of a millisecond", ttl: 1500 * time.Microsecond, expected: 2},
+		{name: "longest duration does not overflow", ttl: math.MaxInt64, expected: 9223372036855},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := miniredis.RunT(t)
+			recorder := &scriptRecorder{}
+			store := newStore[string, string](t, &redisadapter.Options[string]{
+				Client:    newClient(t, server, recorder),
+				KeyCodec:  cache.StringKeyCodec{},
+				KeyPrefix: "items",
+				TTL:       testCase.ttl,
+			})
+
+			require.NoError(t, store.Set(t.Context(), "key", "value"))
+
+			require.Len(t, recorder.calls, 1)
+			// EVALSHA sha numkeys key value ttl channel event
+			require.Equal(t, testCase.expected, recorder.calls[0][5])
+		})
+	}
+}
+
+func TestNewAcceptsAnHourlyHeartbeat(t *testing.T) {
+	server := miniredis.RunT(t)
+
+	newStore[string, string](t, &redisadapter.Options[string]{
+		Client:            newClient(t, server),
+		KeyCodec:          cache.StringKeyCodec{},
+		KeyPrefix:         "items",
+		HeartbeatInterval: time.Hour,
+	})
+}
+
 func TestStoreTTLOfMissingKeyIsNotFound(t *testing.T) {
 	server := miniredis.RunT(t)
 	store := newStore[string, string](t, &redisadapter.Options[string]{
@@ -236,8 +315,8 @@ type operation struct {
 }
 
 // operations call every Store method that talks to Redis; command is the Redis command each
-// one sends last, with "items:alice" stored and an event channel set. Set and Remove run a
-// script, which go-redis sends as EVALSHA.
+// one sends last, with "items:alice" stored and an event channel set. Set, Remove and the
+// removal of RemovePrefix run a script, which go-redis sends as EVALSHA.
 var operations = []operation{
 	{name: "get", command: "get", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
 		_, err := store.Get(ctx, "alice")
@@ -256,7 +335,7 @@ var operations = []operation{
 	{name: "remove prefix scanning", command: "scan", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
 		return store.RemovePrefix(ctx, "a")
 	}},
-	{name: "remove prefix unlinking", command: "unlink", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
+	{name: "remove prefix unlinking", command: "evalsha", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
 		return store.RemovePrefix(ctx, "a")
 	}},
 	{name: "remove prefix publishing", command: "publish", run: func(ctx context.Context, store *redisadapter.Store[string, string]) error {
@@ -291,7 +370,7 @@ func newStoreForOperations(t *testing.T, hooks ...redis.Hook) *redisadapter.Stor
 func TestStoreHidesRedisErrorChains(t *testing.T) {
 	for _, testCase := range operations {
 		t.Run(testCase.name, func(t *testing.T) {
-			store := newStoreForOperations(t, failingHook{command: testCase.command})
+			store := newStoreForOperations(t, &failingHook{command: testCase.command})
 
 			err := testCase.run(t.Context(), store)
 

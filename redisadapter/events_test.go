@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/govengers/cache"
@@ -280,25 +283,130 @@ func TestEventsFromTheWire(t *testing.T) {
 	}
 }
 
-func TestRemovePrefixPublishesEvenWhenRemovalFails(t *testing.T) {
+// countRemovePrefixEvents removes key as a marker and counts the EventRemovePrefix events for
+// prefix that arrive before the marker's EventRemove.
+func countRemovePrefixEvents(t *testing.T, store *redisadapter.Store[string, string], events <-chan cache.Event[string, string], prefix, marker string) int {
+	t.Helper()
+	require.NoError(t, store.Remove(t.Context(), marker))
+	count := 0
+	for {
+		event := receive(t, events)
+		if event.Type == cache.EventRemove && event.Key == marker {
+			return count
+		}
+		require.Equal(t, cache.Event[string, string]{Type: cache.EventRemovePrefix, Prefix: prefix}, event)
+		count++
+	}
+}
+
+func TestRemovePrefixRemovesManyKeysInChunks(t *testing.T) {
+	const keyCount = 2500 // one SCAN page from miniredis, three scripts of at most 1000 keys
 	server := miniredis.RunT(t)
-	store := newStore[string, string](t, &redisadapter.Options[string]{
-		Client:       newClient(t, server, failingHook{command: "unlink"}),
+	store := newEventStore[string, string](t, server, &redisadapter.Options[string]{KeyCodec: cache.StringKeyCodec{}, KeyPrefix: "items"})
+	events := collect(store)
+	for index := range keyCount {
+		require.NoError(t, server.Set(fmt.Sprintf("items:key:%d", index), encode(t, "value")))
+	}
+	require.NoError(t, server.Set("other:key:1", encode(t, "outside")))
+
+	require.NoError(t, store.RemovePrefix(t.Context(), "key:"))
+
+	require.Equal(t, []string{"other:key:1"}, server.Keys())
+	require.Equal(t, 3+1, countRemovePrefixEvents(t, store, events, "key:", "marker"), "one event per script and a final one")
+}
+
+func TestRemovePrefixAnnouncesEveryPage(t *testing.T) {
+	server := miniredis.RunT(t)
+	store := newEventStore[string, string](t, server, &redisadapter.Options[string]{KeyCodec: cache.StringKeyCodec{}, KeyPrefix: "items"})
+	pagingStore := newStore[string, string](t, &redisadapter.Options[string]{
+		Client:       newClient(t, server, &pagingHook{}),
 		KeyCodec:     cache.StringKeyCodec{},
 		KeyPrefix:    "items",
 		EventChannel: eventChannel,
 	})
-	awaitSubscription(t, store)
 	events := collect(store)
-	ctx := t.Context()
-	require.NoError(t, store.Set(ctx, "alice", "value"))
-	require.Equal(t, cache.EventSet, receive(t, events).Type)
+	for _, key := range []string{"a", "b", "c"} {
+		require.NoError(t, server.Set("items:"+key, encode(t, "value")))
+	}
 
-	err := store.RemovePrefix(ctx, "al")
+	require.NoError(t, pagingStore.RemovePrefix(t.Context(), ""))
+
+	require.Empty(t, server.Keys())
+	require.Equal(t, 3+1, countRemovePrefixEvents(t, store, events, "", "marker"), "one event per page and a final one")
+}
+
+func TestRemovePrefixAnnouncesEvenWhenNothingMatched(t *testing.T) {
+	server := miniredis.RunT(t)
+	store := newEventStore[string, string](t, server, &redisadapter.Options[string]{KeyCodec: cache.StringKeyCodec{}, KeyPrefix: "items"})
+	events := collect(store)
+
+	require.NoError(t, store.RemovePrefix(t.Context(), "missing"))
+
+	require.Equal(t, 1, countRemovePrefixEvents(t, store, events, "missing", "marker"))
+}
+
+func TestRemovePrefixAnnouncesRemovedPagesWhenALaterPageFails(t *testing.T) {
+	server := miniredis.RunT(t)
+	store := newEventStore[string, string](t, server, &redisadapter.Options[string]{KeyCodec: cache.StringKeyCodec{}, KeyPrefix: "items"})
+	// The first page's script passes, the second page's fails.
+	failingStore := newStore[string, string](t, &redisadapter.Options[string]{
+		Client:       newClient(t, server, &pagingHook{}, &failingHook{command: "evalsha", passing: 1}),
+		KeyCodec:     cache.StringKeyCodec{},
+		KeyPrefix:    "items",
+		EventChannel: eventChannel,
+	})
+	events := collect(store)
+	for _, key := range []string{"a", "b", "c"} {
+		require.NoError(t, server.Set("items:"+key, encode(t, "value")))
+	}
+
+	err := failingStore.RemovePrefix(t.Context(), "")
 
 	require.ErrorContains(t, err, errInjected.Error())
-	require.Equal(t, cache.Event[string, string]{Type: cache.EventRemovePrefix, Prefix: "al"}, receive(t, events))
-	require.True(t, server.Exists("items:alice"))
+	require.NotErrorIs(t, err, errInjected)
+	require.Equal(t, []string{"items:b", "items:c"}, server.Keys())
+	require.Equal(t, 1+1, countRemovePrefixEvents(t, store, events, "", "marker"), "the removed page and the final event")
+}
+
+// registerHeavyHandler registers a handler holding a large allocation and returns a weak pointer
+// to it and the handler's unregister function.
+func registerHeavyHandler(store *redisadapter.Store[string, string]) (weak.Pointer[[1 << 20]byte], func()) {
+	heavy := new([1 << 20]byte)
+	unregister := store.OnEvent(func(cache.Event[string, string]) { heavy[0]++ })
+	return weak.Make(heavy), unregister
+}
+
+func TestUnregisteredHandlerIsNotRetained(t *testing.T) {
+	testCases := []struct {
+		name     string
+		position int
+	}{
+		{name: "first handler", position: 0},
+		{name: "middle handler", position: 1},
+		{name: "last handler", position: 2},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := miniredis.RunT(t)
+			store := newStore[string, string](t, &redisadapter.Options[string]{Client: newClient(t, server), KeyCodec: cache.StringKeyCodec{}, KeyPrefix: "items"})
+			var heavy weak.Pointer[[1 << 20]byte]
+			var unregister func()
+			for position := range 3 {
+				if position == testCase.position {
+					heavy, unregister = registerHeavyHandler(store)
+				} else {
+					store.OnEvent(func(cache.Event[string, string]) {})
+				}
+			}
+
+			unregister()
+
+			require.Eventually(t, func() bool {
+				runtime.GC()
+				return heavy.Value() == nil
+			}, waitDeadline, pollInterval)
+		})
+	}
 }
 
 func TestOnEventUnregister(t *testing.T) {
@@ -383,20 +491,108 @@ func TestCloseIsIdempotentAndPrompt(t *testing.T) {
 				server.Close()
 			}
 
-			closed := make(chan struct{})
-			go func() {
-				defer close(closed)
-				store.Close()
-				store.Close()
-			}()
-
-			select {
-			case <-closed:
-			case <-time.After(waitDeadline):
-				t.Fatal("Close did not return")
-			}
+			require.NoError(t, store.Close(withTimeout(t, waitDeadline)))
+			require.NoError(t, store.Close(withTimeout(t, waitDeadline)))
 		})
 	}
+}
+
+// blockingHeartbeatHook holds every heartbeat pipeline while blocking is set, ignoring its
+// context, until release is closed.
+type blockingHeartbeatHook struct {
+	blocking atomic.Bool
+	blocked  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (*blockingHeartbeatHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (*blockingHeartbeatHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return next
+}
+
+func (h *blockingHeartbeatHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, commands []redis.Cmder) error {
+		if h.blocking.Load() {
+			h.once.Do(func() { close(h.blocked) })
+			<-h.release
+		}
+		return next(ctx, commands)
+	}
+}
+
+func TestCloseReturnsTheContextErrorWhenReceivingDoesNotStop(t *testing.T) {
+	server := miniredis.RunT(t)
+	hook := &blockingHeartbeatHook{blocked: make(chan struct{}), release: make(chan struct{})}
+	store, err := redisadapter.New[string, string](&redisadapter.Options[string]{
+		Client:            newClient(t, server, hook),
+		KeyCodec:          cache.StringKeyCodec{},
+		KeyPrefix:         "items",
+		EventChannel:      eventChannel,
+		HeartbeatInterval: 50 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	awaitSubscription(t, store)
+	hook.blocking.Store(true)
+	<-hook.blocked
+
+	err = store.Close(withTimeout(t, 50*time.Millisecond))
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	close(hook.release)
+	require.NoError(t, store.Close(withTimeout(t, waitDeadline)))
+}
+
+// panickingOnceHook panics in the first heartbeat pipeline after armed is set, inside the
+// store's receiving goroutine.
+type panickingOnceHook struct {
+	armed    atomic.Bool
+	panicked atomic.Bool
+}
+
+func (*panickingOnceHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (*panickingOnceHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return next
+}
+
+func (h *panickingOnceHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, commands []redis.Cmder) error {
+		if h.armed.Load() && h.panicked.CompareAndSwap(false, true) {
+			panic("broken heartbeat")
+		}
+		return next(ctx, commands)
+	}
+}
+
+func TestReceivingRestartsAfterAPanic(t *testing.T) {
+	server := miniredis.RunT(t)
+	logger, logged := newLogger()
+	hook := &panickingOnceHook{}
+	store := newStore[string, string](t, &redisadapter.Options[string]{
+		Client:            newClient(t, server, hook),
+		KeyCodec:          cache.StringKeyCodec{},
+		KeyPrefix:         "items",
+		EventChannel:      eventChannel,
+		HeartbeatInterval: 50 * time.Millisecond,
+		Logger:            logger,
+	})
+	awaitSubscription(t, store)
+	events := collect(store)
+
+	hook.armed.Store(true)
+
+	require.Equal(t, cache.Event[string, string]{Type: cache.EventReset}, receive(t, events))
+	require.True(t, hook.panicked.Load())
+	require.Contains(t, logged.String(), "redisadapter: receiving events panicked")
+	require.Contains(t, logged.String(), "broken heartbeat")
+	require.NoError(t, store.Set(t.Context(), "alice", "value"))
+	require.Equal(t, cache.Event[string, string]{Type: cache.EventSet, Key: "alice", Value: "value"}, receive(t, events))
 }
 
 // heartbeatDroppingHook drops the heartbeats the subscription publishes to itself, which go out

@@ -54,7 +54,11 @@ func ExampleSynchronized() {
 	if err != nil {
 		panic(err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(context.Background()); err != nil {
+			panic(err)
+		}
+	}()
 
 	greetings, err := cache.NewSynchronized(&cache.SynchronizedOptions[string, string]{
 		Backend:   store,
