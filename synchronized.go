@@ -146,9 +146,7 @@ func (c *Synchronized[K, V]) Set(ctx context.Context, key K, value V) error {
 		c.fence.finishRead(key, ticket, nil)
 		return err
 	}
-	// A change applied meanwhile may be newer than this write; its event, or the next read,
-	// brings the local cache up to date.
-	c.fence.finishWrite(key, ticket, func() { c.local.Set(key, value) })
+	c.fence.finishWrite(key, ticket, func() { c.local.Set(key, value) }, func() { c.local.Remove(key) })
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -355,6 +356,8 @@ func TestSynchronizedGetKeepsAReadUnlessItsKeyChangedMeanwhile(t *testing.T) {
 	}
 }
 
+// A sync Set overtaken by a change of its key cannot tell which of the two the backend holds
+// last, so it drops the local copy and the next read refills it.
 func TestSynchronizedSetKeepsItsValueUnlessTheKeyChangedMeanwhile(t *testing.T) {
 	for _, testCase := range changesDuringRead {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -369,7 +372,11 @@ func TestSynchronizedSetKeepsItsValueUnlessTheKeyChangedMeanwhile(t *testing.T) 
 
 			require.NoError(t, synchronized.Set(t.Context(), "user:1", "written"))
 
-			requireReadOutcome(t, synchronized, "written", testCase.events, testCase.kept)
+			if testCase.kept {
+				requireLocal(t, synchronized, "user:1", "written")
+			} else {
+				requireNotLocal(t, synchronized, "user:1")
+			}
 		})
 	}
 }
@@ -506,4 +513,51 @@ func TestSynchronizedPreloadInFlightAcrossASetSkipsThatKey(t *testing.T) {
 
 	requireLocal(t, synchronized, "written", "new")
 	requireLocal(t, synchronized, "other", "value")
+}
+
+// TestSynchronizedOverlappingSetsLeaveNoStaleLocalCopy covers two sync Sets of one key whose
+// backend writes commit A then B, while A returns first: A's local copy must not outlive B.
+func TestSynchronizedOverlappingSetsLeaveNoStaleLocalCopy(t *testing.T) {
+	var mutex sync.Mutex
+	stored := ""
+	commit := func(value string) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		stored = value
+	}
+	firstCommitted, secondCommitted, firstReturned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	backend := newFakeBackend() // emits no events, as when the event channel is down
+	backend.set = func(_ context.Context, _, value string) error {
+		switch value {
+		case "A":
+			commit(value)
+			close(firstCommitted)
+			<-secondCommitted
+		case "B":
+			<-firstCommitted
+			commit(value)
+			close(secondCommitted)
+			<-firstReturned
+		}
+		return nil
+	}
+	backend.get = func(context.Context, string) (string, error) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		return stored, nil
+	}
+	synchronized := newSynchronized(t, &cache.SynchronizedOptions[string, string]{Backend: backend})
+
+	results := make(chan error, 2)
+	go func() {
+		results <- synchronized.Set(context.Background(), "key", "A")
+		close(firstReturned)
+	}()
+	go func() { results <- synchronized.Set(context.Background(), "key", "B") }()
+	require.NoError(t, <-results)
+	require.NoError(t, <-results)
+
+	value, err := synchronized.Get(t.Context(), "key")
+	require.NoError(t, err)
+	require.Equal(t, "B", value)
 }

@@ -132,13 +132,13 @@ func callBefore[T any](ctx context.Context, election *Election, deadline time.Ti
 	callContext, cancel := context.WithDeadline(ctx, deadline)
 	results := make(chan callResult[T], 1)
 	election.running.Go(func() {
-		defer func() { <-election.callSlot }()
-		defer cancel()
 		result := callResult[T]{err: errors.New("leader: redis call panicked")}
 		recovery.Run(election.logger, "leader: redis call", func() {
 			value, err := call(callContext)
 			result = callResult[T]{value: value, err: err}
 		})
+		cancel()
+		<-election.callSlot // free before the result is seen, so the next call can follow at once
 		results <- result
 	})
 	timer := time.NewTimer(time.Until(deadline))

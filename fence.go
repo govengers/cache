@@ -63,15 +63,19 @@ func (f *readFence[K, V]) finishRead(key K, ticket readTicket, keep func()) {
 	}
 }
 
-// finishWrite ends a write of key that began with beginRead. Unless key changed since, it calls
-// keep and counts as a change itself, so reads and loads of key that started before the write
-// do not keep their older values.
-func (f *readFence[K, V]) finishWrite(key K, ticket readTicket, keep func()) {
+// finishWrite ends a write of key that began with beginRead and counts as a change itself, so
+// reads and loads of key that started before the write do not keep their older values. It calls
+// keep when key did not change since beginRead, and drop otherwise: a concurrent change may be
+// older or newer than this write, so neither value can be trusted and the next read refills it.
+func (f *readFence[K, V]) finishWrite(key K, ticket readTicket, keep, drop func()) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
-	if f.endRead(key, ticket) {
-		f.markChanged(key)
+	unchanged := f.endRead(key, ticket)
+	f.markChanged(key)
+	if unchanged {
 		keep()
+	} else {
+		drop()
 	}
 }
 

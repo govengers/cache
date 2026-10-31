@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"math"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -996,4 +997,232 @@ func TestNewGeneratesDistinctInstanceIDs(t *testing.T) {
 
 	require.NotEqual(t, first.options.InstanceID, second.options.InstanceID)
 	require.Empty(t, options.InstanceID, "New must not modify the caller's options")
+}
+
+func TestElectionKeepsOneBackgroundReleaseInFlight(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	client := newClient(t, miniRedis)
+	renewHook := newScriptHook(t, client, renewScript)
+	releaseHook := newScriptHook(t, client, releaseScript)
+	unblock := make(chan struct{})
+	closeUnblock := sync.OnceFunc(func() { close(unblock) })
+	var releases, demotions atomic.Int32
+	renewHook.intercept(func(context.Context, func(context.Context) error) error {
+		return errors.New("injected renewal failure")
+	})
+	releaseHook.intercept(func(context.Context, func(context.Context) error) error {
+		releases.Add(1)
+		<-unblock
+		return errors.New("hung release gave up")
+	})
+	logs := &logBuffer{}
+	options := testOptions(client)
+	options.RetryInterval = 20 * time.Millisecond
+	options.Logger = logs.logger()
+	options.OnDemoted = func() { demotions.Add(1) }
+	election := startElection(t, options)
+	t.Cleanup(closeUnblock) // runs before the election is stopped, which waits for the release
+
+	require.Eventually(t, func() bool { return releases.Load() == 1 }, waitTimeout, pollInterval)
+	// The hung release leaves the lock behind; once it expired the election leads and steps
+	// down again.
+	miniRedis.FastForward(options.LeaseDuration)
+	require.Eventually(t, func() bool { return demotions.Load() >= 2 }, waitTimeout, pollInterval)
+	require.Eventually(t, func() bool {
+		return logs.contains("leader: a release is still in flight, the lock expires with its lease")
+	}, waitTimeout, pollInterval)
+	require.Equal(t, int32(1), releases.Load())
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- election.Stop(context.Background()) }()
+	require.Never(t, func() bool { return len(stopped) > 0 }, testLease/3, pollInterval)
+	closeUnblock()
+	require.NoError(t, receive(t, stopped))
+}
+
+func TestElectionNeverLeadsAfterStopStarted(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	client := newClient(t, miniRedis)
+	acquireHook := newScriptHook(t, client, acquireScript)
+	acquiring := make(chan struct{}, 1)
+	proceed := make(chan struct{})
+	closeProceed := sync.OnceFunc(func() { close(proceed) })
+	// The reply comes after Stop started but long before the lease deadline.
+	acquireHook.intercept(func(ctx context.Context, call func(context.Context) error) error {
+		select {
+		case acquiring <- struct{}{}:
+		default:
+		}
+		<-proceed
+		return call(context.WithoutCancel(ctx))
+	})
+	var elected atomic.Bool
+	options := testOptions(client)
+	options.LeaseDuration = 10 * time.Second
+	options.OnElected = func(context.Context, int64) { elected.Store(true) }
+	election := startElection(t, options)
+	t.Cleanup(closeProceed)
+	receive(t, acquiring)
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- election.Stop(context.Background()) }()
+	require.Eventually(t, func() bool {
+		election.mutex.Lock()
+		defer election.mutex.Unlock()
+		return election.stopped
+	}, waitTimeout, pollInterval)
+	var ledAfterStop atomic.Bool
+	stopReturned := make(chan struct{})
+	watching := make(chan struct{})
+	go func() {
+		defer close(watching)
+		for {
+			select {
+			case <-stopReturned:
+				return
+			default:
+				if election.IsLeader() {
+					ledAfterStop.Store(true)
+				}
+			}
+		}
+	}()
+	closeProceed()
+
+	stopError := receive(t, stopped)
+	close(stopReturned)
+	<-watching
+	require.NoError(t, stopError)
+	require.False(t, ledAfterStop.Load())
+	require.False(t, elected.Load())
+	epoch, err := miniRedis.Get(testLockKey + ":epoch")
+	require.NoError(t, err)
+	require.Equal(t, "1", epoch, "the acquisition did not reach Redis")
+	require.False(t, miniRedis.Exists(testLockKey))
+}
+
+func TestElectionReacquiresAtOnceAfterLostRenewal(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	client := newClient(t, miniRedis)
+	renewHook := newScriptHook(t, client, renewScript)
+	logs := &logBuffer{}
+	options := testOptions(client)
+	// Only the attempt right after the demotion can win within waitTimeout.
+	options.RetryInterval = 10 * time.Second
+	options.Logger = logs.logger()
+	election := startElection(t, options)
+	waitForLeadership(t, election)
+	var renewals atomic.Int32
+	// Another process holds the lock during one renewal and has resigned when it returns.
+	renewHook.intercept(func(ctx context.Context, call func(context.Context) error) error {
+		if renewals.Add(1) > 1 {
+			return call(ctx)
+		}
+		_ = miniRedis.Set(testLockKey, "other:99")
+		err := call(ctx)
+		miniRedis.Del(testLockKey)
+		return err
+	})
+
+	require.Eventually(t, func() bool { return election.FencingToken() == 2 }, waitTimeout, pollInterval)
+	require.True(t, logs.contains("another process holds the lock"))
+	require.False(t, logs.contains(errCallInFlight.Error()))
+}
+
+func TestElectionReleasesLockWhenPromotionLosesToTheEndOfTheElection(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	client := newClient(t, miniRedis)
+	acquireHook := newScriptHook(t, client, acquireScript)
+	proceed := make(chan struct{})
+	closeProceed := sync.OnceFunc(func() { close(proceed) })
+	acquireHook.intercept(func(ctx context.Context, call func(context.Context) error) error {
+		<-proceed
+		return call(ctx)
+	})
+	var elected atomic.Bool
+	options := testOptions(client)
+	options.LeaseDuration = 10 * time.Second
+	options.OnElected = func(context.Context, int64) { elected.Store(true) }
+	election := newElection(t, options)
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, election.Start(ctx))
+	t.Cleanup(closeProceed)
+
+	// Holding the mutex parks the election in promote, after the reply counted, until the
+	// election's context ended.
+	election.mutex.Lock()
+	closeProceed()
+	require.Eventually(t, func() bool { return goroutinesContain("leader.(*Election).promote") }, waitTimeout, pollInterval)
+	cancel()
+	election.mutex.Unlock()
+
+	require.Eventually(t, func() bool { return !miniRedis.Exists(testLockKey) }, waitTimeout, pollInterval)
+	require.False(t, election.IsLeader())
+	require.False(t, elected.Load())
+	epoch, err := miniRedis.Get(testLockKey + ":epoch")
+	require.NoError(t, err)
+	require.Equal(t, "1", epoch, "the acquisition did not reach Redis")
+	require.NoError(t, election.Stop(context.Background()))
+}
+
+func goroutinesContain(function string) bool {
+	stacks := make([]byte, 1<<20)
+	return bytes.Contains(stacks[:runtime.Stack(stacks, true)], []byte(function))
+}
+
+func TestElectionLogsFailedReleaseAfterTheContextEnded(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	logs := &logBuffer{}
+	options := testOptions(newClient(t, miniRedis))
+	options.LeaseDuration = 10 * time.Second
+	options.Logger = logs.logger()
+	election := newElection(t, options)
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, election.Start(ctx))
+	waitForLeadership(t, election)
+	miniRedis.SetError("ERR injected failure")
+
+	cancel()
+
+	require.Eventually(t, func() bool {
+		return logs.contains("leader: resigning failed, the lock expires with its lease")
+	}, waitTimeout, pollInterval)
+	require.False(t, election.IsLeader())
+}
+
+// failingCommandHook fails every command called name.
+type failingCommandHook struct {
+	name string
+}
+
+func (h *failingCommandHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *failingCommandHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *failingCommandHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, command redis.Cmder) error {
+		if command.Name() == h.name {
+			return errors.New("injected " + h.name + " failure")
+		}
+		return next(ctx, command)
+	}
+}
+
+func TestElectionStopReturnsOpaqueErrorWhenAnnouncementFails(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	client := newClient(t, miniRedis)
+	options := testOptions(client)
+	options.LeaseDuration = 10 * time.Second
+	options.EventChannel = testEventChannel
+	election := startElection(t, options)
+	waitForLeadership(t, election)
+	client.AddHook(&failingCommandHook{name: "publish"})
+
+	err := election.Stop(context.Background())
+
+	require.ErrorContains(t, err, "leader: announcing the resignation on "+testEventChannel)
+	require.Nil(t, errors.Unwrap(err), "the error exposes the go-redis error")
+	require.False(t, miniRedis.Exists(testLockKey))
 }

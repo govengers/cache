@@ -159,10 +159,7 @@ func TestReadFenceFinishWrite(t *testing.T) {
 		fence := newReadFence[string, string](StringKeyCodec{})
 		write := fence.beginRead("key")
 
-		kept := false
-		fence.finishWrite("key", write, func() { kept = true })
-
-		require.True(t, kept)
+		require.Equal(t, "kept", finishWrite(fence, "key", write))
 		require.Empty(t, fence.readsInFlight)
 	})
 	t.Run("drops a write overtaken by a change", func(t *testing.T) {
@@ -170,16 +167,33 @@ func TestReadFenceFinishWrite(t *testing.T) {
 		write := fence.beginRead("key")
 		fence.changeKey("key", func() {})
 
-		kept := false
-		fence.finishWrite("key", write, func() { kept = true })
+		require.Equal(t, "dropped", finishWrite(fence, "key", write))
+	})
+	t.Run("of two overlapping writes the first finisher keeps, the second drops", func(t *testing.T) {
+		fence := newReadFence[string, string](StringKeyCodec{})
+		first := fence.beginRead("key")
+		second := fence.beginRead("key")
 
+		require.Equal(t, "kept", finishWrite(fence, "key", first))
+		require.Equal(t, "dropped", finishWrite(fence, "key", second))
+		require.Empty(t, fence.readsInFlight)
+	})
+	t.Run("a dropped write still counts as a change", func(t *testing.T) {
+		fence := newReadFence[string, string](StringKeyCodec{})
+		write := fence.beginRead("key")
+		fence.changeKey("key", func() {})
+		read := fence.beginRead("key") // began after the change, before the write finished
+
+		require.Equal(t, "dropped", finishWrite(fence, "key", write))
+		kept := false
+		fence.finishRead("key", read, func() { kept = true })
 		require.False(t, kept)
 	})
 	t.Run("counts as a change for reads that began before it", func(t *testing.T) {
 		fence := newReadFence[string, string](StringKeyCodec{})
 		read := fence.beginRead("key")
 		write := fence.beginRead("key")
-		fence.finishWrite("key", write, func() {})
+		finishWrite(fence, "key", write)
 		later := fence.beginRead("key")
 
 		var kept []string
@@ -193,7 +207,7 @@ func TestReadFenceFinishWrite(t *testing.T) {
 		fence := newReadFence[string, string](StringKeyCodec{})
 		tracker := fence.beginLoad()
 		write := fence.beginRead("written")
-		fence.finishWrite("written", write, func() {})
+		finishWrite(fence, "written", write)
 
 		var kept []string
 		entries := []Entry[string, string]{{Key: "written", Value: "old"}, {Key: "other", Value: "value"}}
@@ -201,4 +215,11 @@ func TestReadFenceFinishWrite(t *testing.T) {
 
 		require.Equal(t, []string{"other"}, kept)
 	})
+}
+
+// finishWrite finishes a write of key and reports whether the fence kept or dropped it.
+func finishWrite(fence *readFence[string, string], key string, ticket readTicket) string {
+	outcome := ""
+	fence.finishWrite(key, ticket, func() { outcome = "kept" }, func() { outcome = "dropped" })
+	return outcome
 }

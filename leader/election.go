@@ -75,6 +75,8 @@ type Election struct {
 	// callSlot admits one Redis call of the election at a time: a call abandoned at its
 	// deadline holds it until go-redis gives up on the call, so abandoned calls cannot pile up.
 	callSlot chan struct{}
+	// releaseSlot does the same for background releases of the lock.
+	releaseSlot chan struct{}
 
 	mutex   sync.Mutex
 	started bool
@@ -100,10 +102,11 @@ func New(options *Options) (*Election, error) {
 		return nil, err
 	}
 	return &Election{
-		options:  resolved,
-		logger:   cmp.Or(resolved.Logger, slog.New(slog.DiscardHandler)),
-		wake:     make(chan struct{}, 1),
-		callSlot: make(chan struct{}, 1),
+		options:     resolved,
+		logger:      cmp.Or(resolved.Logger, slog.New(slog.DiscardHandler)),
+		wake:        make(chan struct{}, 1),
+		callSlot:    make(chan struct{}, 1),
+		releaseSlot: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -207,11 +210,9 @@ func (e *Election) Stop(ctx context.Context) error {
 	e.stop()
 	// Step down before waiting: an abandoned Redis call can take until the client's timeouts,
 	// and the process must not claim the leadership meanwhile.
+	// promote refuses once the election context ended, so no term begins after this demote.
 	ended := e.demote()
 	e.running.Wait()
-	if promotedMeanwhile := e.demote(); promotedMeanwhile != nil {
-		ended = promotedMeanwhile
-	}
 	if ended == nil {
 		return nil
 	}
@@ -273,10 +274,11 @@ func (e *Election) holdLeadership(ctx context.Context, current *leadership) {
 			return
 		case <-deadline.C:
 			e.logger.Warn("leader: no renewal succeeded in time, stepping down before the lease may expire", "lock", e.options.LockKey)
-			e.demote()
 			// The lock may still hold this term's value; releasing it lets a follower take over
-			// at once instead of after the lease.
-			e.resignInBackground(current.lockValue)
+			// at once instead of after the lease. Stop releases on its own if it demoted first.
+			if ended := e.demote(); ended != nil {
+				e.resignInBackground(ended.lockValue)
+			}
 			return
 		case <-ticker.C:
 		}
@@ -314,6 +316,13 @@ func (e *Election) promote(ctx context.Context, fencingToken int64, lockValue st
 		callbackDone:   make(chan struct{}),
 	}
 	e.mutex.Lock()
+	if ctx.Err() != nil {
+		// Stop or the end of Start's context came first; the lock goes back at once.
+		e.mutex.Unlock()
+		cancel()
+		e.resignInBackground(lockValue)
+		return nil
+	}
 	e.current = current
 	e.mutex.Unlock()
 
@@ -377,8 +386,17 @@ func (e *Election) resignUnlessStopping(ctx context.Context) {
 }
 
 // resignInBackground releases lockValue if the lock still holds it, without waiting for Redis.
+// One release runs at a time: while one hangs, later ones are skipped and their locks expire with
+// their lease, so hanging releases cannot pile up.
 func (e *Election) resignInBackground(lockValue string) {
+	select {
+	case e.releaseSlot <- struct{}{}:
+	default:
+		e.logger.Warn("leader: a release is still in flight, the lock expires with its lease", "lock", e.options.LockKey)
+		return
+	}
 	e.running.Go(func() {
+		defer func() { <-e.releaseSlot }()
 		recovery.Run(e.logger, "leader: resigning", func() {
 			resignContext, cancel := context.WithTimeout(context.Background(), e.options.LeaseDuration)
 			defer cancel()
