@@ -17,7 +17,7 @@ lint:
 # Unit tests with the race detector; fails below the coverage threshold (examples excluded)
 test:
     mkdir -p sandbox
-    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -count=1 -coverprofile=sandbox/unit.raw.cover ./...
+    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -coverprofile=sandbox/unit.raw.cover ./...
     grep -v -E '{{excluded}}' sandbox/unit.raw.cover > sandbox/unit.cover
     go tool cover -func=sandbox/unit.cover > sandbox/unit.func
     awk -v threshold={{coverage_threshold}} '/^total:/ { found = 1; sub("%", "", $3); print "coverage " $3 "%"; if ($3 + 0 < threshold) { print "coverage is below " threshold "%"; exit 1 } } END { if (!found) { print "no coverage total"; exit 1 } }' sandbox/unit.func
