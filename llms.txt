@@ -1,0 +1,39 @@
+# govengers/cache
+
+> Typed caches and leader election for Go: `cache.Local` is an in-memory LRU cache with an optional TTL; `cache.Synchronized` puts a local cache in front of a shared `cache.Backend` (the Redis `redisadapter.Store`), serves reads locally, writes to both, and keeps the local copies of every process in step through the store's change events (Redis Pub/Sub, at most once, `EventReset` after every reconnect); `leader.Election` elects one leader among processes sharing a Redis, with a lease and a fencing token per leadership. The root package depends on the standard library only.
+
+- Module: `github.com/govengers/cache` (v1), Go 1.26, Apache 2.0. Successor of `github.com/mxcd/go-cache` v0.
+- Packages: `cache` (root), `redisadapter`, `leader`.
+- Constructors are `New...(options *Options) (*X, error)` and validate at startup. Every type is safe for concurrent use. Values are stored as given, not copied.
+- The caller owns the `*redis.Client` (create, instrument with redisotel, close last). Redis Sentinel via `redis.NewFailoverClient` is supported; Redis Cluster is not.
+- No logging of its own: an optional `Logger *slog.Logger` receives what cannot be returned. Misses match `cache.ErrNotFound`; calls after `Synchronized.Close` return `cache.ErrClosed`.
+- Standards: govengers/standards, `library` profile (`.govengers.yml`).
+
+## Docs
+
+- [Home](docs/wiki/Home.md): model, package map, which type for which need, wiring order.
+- [Local-Cache](docs/wiki/Local-Cache.md): `Local`, TTL, size, prefixes, custom `KeyCodec`.
+- [Synchronized-Cache](docs/wiki/Synchronized-Cache.md): options, consistency guarantees, async writes, preload, shutdown order.
+- [Redis-Store](docs/wiki/Redis-Store.md): `redisadapter` options, key layout, MessagePack values, events, timeouts, Sentinel, tracing.
+- [Leader-Election](docs/wiki/Leader-Election.md): options, lifecycle, timing, fencing tokens, Sentinel caveat.
+- [Custom-Backend](docs/wiki/Custom-Backend.md): the `cache.Backend` contract for stores other than Redis.
+- [Migration](docs/wiki/Migration.md): v0 `mxcd/go-cache` to v1, API mapping table.
+- [Gotchas](docs/wiki/Gotchas.md): the non-obvious rules, one line each.
+
+## Examples
+
+- [examples/synchronized/main.go](examples/synchronized/main.go): two replicas of a product catalog on one Redis; a price change and a removal propagate between their local caches.
+- [examples/leader/main.go](examples/leader/main.go): two scheduler instances; leadership moves on `Stop`, and a job table refuses the old term's late write by fencing token.
+- [examples/custombackend/main.go](examples/custombackend/main.go): an in-memory `cache.Backend` implementing the full contract, with two `Synchronized` caches on it.
+- Each `main_test.go` runs the program against miniredis (or in memory); `REDIS_ADDR` points `go run ./examples/<name>` at a real Redis. Package `Example*` functions live in [example_test.go](example_test.go), [redisadapter/example_test.go](redisadapter/example_test.go) and [leader/example_test.go](leader/example_test.go).
+
+## Reference
+
+- [README.md](README.md): overview, package table, quick start.
+- [pkg.go.dev](https://pkg.go.dev/github.com/govengers/cache): API reference.
+- [GitHub Releases](https://github.com/govengers/cache/releases): changelog and release notes.
+
+## Optional
+
+- [test/e2e](test/e2e/cache_test.go): end-to-end suite against Redis and a Sentinel group in Docker ([compose.yml](test/e2e/compose.yml)).
+- [justfile](justfile): `just lint`, `just test`, `just test-e2e`, `just check`.

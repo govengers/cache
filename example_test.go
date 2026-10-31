@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
@@ -33,6 +35,41 @@ func ExampleLocal() {
 	// Output:
 	// 42 true
 	// false
+}
+
+type tenantKey struct {
+	Tenant string
+	ID     int
+}
+
+// tenantKeyCodec encodes a tenantKey as "<tenant>:<id>"; tenants must not contain a colon.
+type tenantKeyCodec struct{}
+
+func (tenantKeyCodec) Encode(key tenantKey) string {
+	return key.Tenant + ":" + strconv.Itoa(key.ID)
+}
+
+func (tenantKeyCodec) Decode(encoded string) (tenantKey, error) {
+	tenant, id, found := strings.Cut(encoded, ":")
+	if !found {
+		return tenantKey{}, fmt.Errorf("tenant key %q has no colon", encoded)
+	}
+	number, err := strconv.Atoi(id)
+	return tenantKey{Tenant: tenant, ID: number}, err
+}
+
+func ExampleKeyCodec() {
+	orders, err := cache.NewLocal[tenantKey, string](&cache.LocalOptions[tenantKey]{KeyCodec: tenantKeyCodec{}})
+	if err != nil {
+		panic(err)
+	}
+	orders.Set(tenantKey{Tenant: "acme", ID: 1}, "desk")
+	orders.Set(tenantKey{Tenant: "globex", ID: 1}, "chair")
+	orders.RemovePrefix("acme:") // every order of one tenant
+
+	fmt.Println(orders.Contains(tenantKey{Tenant: "acme", ID: 1}), orders.Contains(tenantKey{Tenant: "globex", ID: 1}))
+	// Output:
+	// false true
 }
 
 func ExampleSynchronized() {

@@ -3,6 +3,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 gotestsum := "go run gotest.tools/gotestsum@v1.13.0"
 govulncheck := "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0"
 coverage_threshold := "80"
+excluded := "/examples/"
 
 default:
     @just --list
@@ -13,10 +14,11 @@ lint:
     go vet -tags e2e ./test/e2e/...
     golangci-lint run ./...
 
-# Unit tests with the race detector; fails below the coverage threshold
+# Unit tests with the race detector; fails below the coverage threshold (examples excluded)
 test:
     mkdir -p sandbox
-    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -count=1 -coverprofile=sandbox/unit.cover ./...
+    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -count=1 -coverprofile=sandbox/unit.raw.cover ./...
+    grep -v -E '{{excluded}}' sandbox/unit.raw.cover > sandbox/unit.cover
     go tool cover -func=sandbox/unit.cover > sandbox/unit.func
     awk -v threshold={{coverage_threshold}} '/^total:/ { found = 1; sub("%", "", $3); print "coverage " $3 "%"; if ($3 + 0 < threshold) { print "coverage is below " threshold "%"; exit 1 } } END { if (!found) { print "no coverage total"; exit 1 } }' sandbox/unit.func
 
