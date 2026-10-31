@@ -2,83 +2,80 @@ package cache
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strconv"
 	"time"
 )
 
-type CacheKey[K comparable] interface {
-	Marshal(K) string
-	Unmarshal(string) (K, error)
-	MarshallAll([]K) []string
-	UnmarshalAll([]string) ([]K, error)
+// ErrNotFound is returned when a key has no value, either because it was never set, was removed or
+// has expired.
+var ErrNotFound = errors.New("cache: not found")
+
+// Entry is a key with its value.
+type Entry[K comparable, V any] struct {
+	Key   K
+	Value V
 }
 
-type StringCacheKey struct {
-}
+// EventType says what changed in a Backend.
+type EventType int
 
-func (k *StringCacheKey) Marshal(key string) string {
-	return key
-}
+// The event types. Their values are part of the wire format of redisadapter and never change.
+const (
+	// EventSet carries the new value of Event.Key.
+	EventSet EventType = iota + 1
+	// EventRemove says Event.Key was removed.
+	EventRemove
+	// EventRemovePrefix says every key whose encoding starts with Event.Prefix was removed.
+	EventRemovePrefix
+	// EventReset says events may have been lost, so every copy made from earlier events or reads
+	// may be stale. redisadapter sends it each time its subscription to the event channel is
+	// established.
+	EventReset
+)
 
-func (k *StringCacheKey) MarshallAll(keys []string) []string {
-	result := make([]string, len(keys))
-	for i, key := range keys {
-		result[i] = k.Marshal(key)
+// String returns the name of the event type, for logs and test output.
+func (t EventType) String() string {
+	switch t {
+	case EventSet:
+		return "set"
+	case EventRemove:
+		return "remove"
+	case EventRemovePrefix:
+		return "remove prefix"
+	case EventReset:
+		return "reset"
+	default:
+		return "EventType(" + strconv.Itoa(int(t)) + ")"
 	}
-	return result
 }
 
-func (k *StringCacheKey) Unmarshal(data string) (string, error) {
-	return data, nil
+// Event is a change to a Backend, made by this process or by another one sharing the backend.
+type Event[K comparable, V any] struct {
+	Type   EventType
+	Key    K      // EventSet, EventRemove
+	Value  V      // EventSet
+	Prefix string // EventRemovePrefix
 }
 
-func (k *StringCacheKey) UnmarshalAll(data []string) ([]string, error) {
-	result := make([]string, len(data))
-	for i, d := range data {
-		result[i] = d
-	}
-	return result, nil
-}
-
-type IntCacheKey struct {
-}
-
-func (k *IntCacheKey) Marshal(key int) string {
-	return fmt.Sprintf("%d", key)
-}
-
-func (k *IntCacheKey) MarshallAll(keys []int) []string {
-	result := make([]string, len(keys))
-	for i, key := range keys {
-		result[i] = k.Marshal(key)
-	}
-	return result
-}
-
-func (k *IntCacheKey) Unmarshal(data string) (int, error) {
-	return strconv.Atoi(data)
-}
-
-func (k *IntCacheKey) UnmarshalAll(data []string) ([]int, error) {
-	result := make([]int, len(data))
-	for i, d := range data {
-		value, err := k.Unmarshal(d)
-		if err != nil {
-			return nil, err
-		}
-		result[i] = value
-	}
-	return result, nil
-}
-
-type StorageBackend[K comparable, V any] interface {
-	Get(context.Context, K) (*V, error)
-	Ttl(context.Context, K) (time.Duration, error)
-	Set(context.Context, K, V) error
-	Remove(context.Context, K) error
-	RemovePrefix(context.Context, string) error
-	Contains(context.Context, K) (bool, error)
-	Load(context.Context) ([]CacheEntry[K, V], error)
-	AddCallback(func(CacheEvent[K, V]))
+// Backend is the shared store behind a Synchronized cache. redisadapter.Store implements it.
+// Implementations must be safe for concurrent use.
+type Backend[K comparable, V any] interface {
+	// Get returns the value of key, or an error matching ErrNotFound.
+	Get(ctx context.Context, key K) (V, error)
+	// TTL returns the remaining lifetime of key: zero if it never expires, an error matching
+	// ErrNotFound if it does not exist.
+	TTL(ctx context.Context, key K) (time.Duration, error)
+	Set(ctx context.Context, key K, value V) error
+	Remove(ctx context.Context, key K) error
+	// RemovePrefix removes every key whose encoding starts with prefix.
+	RemovePrefix(ctx context.Context, prefix string) error
+	Contains(ctx context.Context, key K) (bool, error)
+	// Load returns every entry in the backend.
+	Load(ctx context.Context) ([]Entry[K, V], error)
+	// KeyCodec returns the codec the backend encodes keys with; prefixes match on its encoding.
+	KeyCodec() KeyCodec[K]
+	// OnEvent registers handler for every change to the backend, including the caller's own, in
+	// the order the backend applied them. The returned function unregisters it.
+	OnEvent(handler func(Event[K, V])) (unregister func())
 }

@@ -1,0 +1,77 @@
+# The end-to-end environment of `just test-e2e`: a standalone Redis, a Sentinel group (primary,
+# replica, one sentinel) and the test runner on one network. The runner lives in the network
+# because Sentinel hands out container addresses that the host cannot reach.
+name: govengers-cache-e2e
+
+x-redis: &redis
+  image: redis:8.10.3-alpine
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 1s
+    retries: 30
+
+services:
+  redis:
+    <<: *redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  redis-primary:
+    <<: *redis
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--replica-announce-ip", "redis-primary"]
+
+  redis-replica:
+    <<: *redis
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--replicaof", "redis-primary", "6379", "--replica-announce-ip", "redis-replica"]
+    depends_on:
+      redis-primary: { condition: service_healthy }
+
+  sentinel:
+    <<: *redis
+    # Sentinel rewrites its configuration file, so it gets a fresh, writable one.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        printf '%s\n' \
+          'port 26379' \
+          'sentinel resolve-hostnames yes' \
+          'sentinel announce-hostnames yes' \
+          'sentinel monitor e2e redis-primary 6379 1' \
+          'sentinel down-after-milliseconds e2e 1000' \
+          'sentinel failover-timeout e2e 5000' > /tmp/sentinel.conf
+        exec redis-sentinel /tmp/sentinel.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 1s
+      retries: 30
+    depends_on:
+      redis-replica: { condition: service_healthy }
+
+  tests:
+    image: golang:1.26
+    working_dir: /module
+    volumes:
+      - ../..:/module
+      - go-modules:/go/pkg/mod
+      - go-build:/root/.cache/go-build
+    environment:
+      E2E_REDIS_ADDRESS: redis:6379
+      E2E_SENTINEL_ADDRESS: sentinel:26379
+      E2E_SENTINEL_MASTER: e2e
+      E2E_OWNER: ${E2E_OWNER:-0:0}
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p sandbox
+        go run gotest.tools/gotestsum@v1.13.0 --format testname --jsonfile sandbox/e2e.json -- -race -tags e2e -count=1 ./test/e2e/...
+        status=$$?
+        chown "$$E2E_OWNER" sandbox/e2e.json
+        exit $$status
+    depends_on:
+      redis: { condition: service_healthy }
+      sentinel: { condition: service_healthy }
+
+volumes:
+  go-modules:
+  go-build:
