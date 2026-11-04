@@ -77,6 +77,20 @@ Redis Cluster is not supported: `Load` and `RemovePrefix` scan one node.
 
 ## Tracing and metrics
 
-Instrument your client: `redisotel.InstrumentTracing(client)`, `redisotel.InstrumentMetrics(client)`. The store adds nothing of its own.
+Instrument your client; the store adds nothing of its own. Traces go through OpenTelemetry, metrics through the service's Prometheus registry (one owner per signal, govengers/standards MET and TRC):
+
+```go
+// traces: a client span per command, without the command text, which holds keys and values
+err := redisotel.InstrumentTracing(client,
+    redisotel.WithTracerProvider(provider.TracerProvider()), // github.com/govengers/telemetry/tracing
+    redisotel.WithDBStatement(false),
+)
+
+// pool metrics on the service's registry: <namespace>_redis_pool_hit_total, _pool_miss_total,
+// _pool_timeout_total, _pool_conn_total_current, _pool_conn_idle_current, _pool_conn_stale_total
+err = registry.Register(redisprometheus.NewCollector("billing", "redis", client)) // github.com/redis/go-redis/extra/redisprometheus/v9
+```
+
+Do not use `redisotel.InstrumentMetrics`: it records OpenTelemetry metrics, which never reach the Prometheus registry.
 
 Source: [redisadapter/store.go](../../redisadapter/store.go), [events.go](../../redisadapter/events.go), [load.go](../../redisadapter/load.go), [internal/subscription](../../internal/subscription/subscription.go).

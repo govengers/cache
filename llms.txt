@@ -5,7 +5,7 @@
 - Module: `github.com/govengers/cache` (v1), Go 1.26, Apache 2.0. Successor of `github.com/mxcd/go-cache` v0.
 - Packages: `cache` (root), `redisadapter`, `leader`.
 - Constructors are `New...(options *Options) (*X, error)` and validate at startup. Every type is safe for concurrent use. Values are stored as given, not copied.
-- The caller owns the `*redis.Client` (create, instrument with redisotel, close last). Redis Sentinel via `redis.NewFailoverClient` is supported; Redis Cluster is not.
+- The caller owns the `*redis.Client` (create, trace with `redisotel.InstrumentTracing(client, redisotel.WithDBStatement(false))`, pool metrics with `redisprometheus.NewCollector` on the service's Prometheus registry, never `redisotel.InstrumentMetrics`, close last). Redis Sentinel via `redis.NewFailoverClient` is supported; Redis Cluster is not.
 - No logging of its own: an optional `Logger *slog.Logger` receives what cannot be returned. Misses match `cache.ErrNotFound`; calls after `Synchronized.Close` return `cache.ErrClosed`.
 - Standards: govengers/standards, `library` profile (`.govengers.yml`).
 
